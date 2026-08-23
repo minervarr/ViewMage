@@ -1,0 +1,23 @@
+# Build trees
+build/
+.cxx/
+app/build/
+.gradle/
+local.properties
+
+# Reading reference only — oupson/jxlviewer, not a dependency of this project.
+# Cloned by hand into reference/ to read its libjxl wiring; nothing here builds
+# against it and nothing here links it.
+reference/
+
+# Sitting in the workspace, not consumed by ViewMage.
+firstparty/
+
+# The wrapper binary itself is a local tool, not project source.
+git_wrapper
+
+# Editor / tooling
+compile_commands.json
+.idea/
+*.iml
+.DS_Store

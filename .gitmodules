@@ -1,0 +1,9 @@
+[submodule "framework/app_shell"]
+	path = framework/app_shell
+	url = https://github.com/minervarr/App_shell
+[submodule "framework/vk_canvas"]
+	path = framework/vk_canvas
+	url = https://github.com/minervarr/Vk_Canvas_Lb_LAW
+[submodule "thirdparty/libjxl"]
+	path = thirdparty/libjxl
+	url = https://github.com/libjxl/libjxl.git
