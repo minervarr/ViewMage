@@ -45,6 +45,40 @@ Desktop tests (no device, no GPU):
 ./tests/run_desktop_tests.sh
 ```
 
+## Colour management is not optional, and its absence does not look like its absence
+
+The first version decoded with `JXL_TYPE_UINT8`, never subscribed to
+`JXL_DEC_COLOR_ENCODING` and never called `JxlDecoderSetCms()`. libjxl then
+hands back the file's own values with **no colour transform at all**, and they
+were drawn as though they were sRGB.
+
+The symptom was HDR photos looking washed out, which reads as a screen
+limitation and is not one. Two things make this worth remembering:
+
+- **It was wrong for ordinary sRGB images too**, just less visibly. Measured
+  against libjxl's own `djxl` reference decode of the same file, the old path
+  returned 60 and 188 where the reference says 52 and 194; the current path
+  returns 53 and 195. The gradient was being pulled toward mid-grey.
+- **The 8-bit truncation happened at the door**, so the extra range was gone
+  before any control could have reached it. No slider could have recovered it.
+
+The decoder now sets a CMS and asks for **linear light, sRGB primaries,
+unclipped float**. Values below 0 (out of gamut) and far above 1 (highlights)
+are meaningful and must survive to the GPU; the single clamp happens in the
+fragment shader after exposure and the tone curve.
+
+`jxl_dec` does **not** link `jxl_cms` (`lib/jxl.cmake:226-229` vs `:219`), so
+`CMakeLists.txt` links it explicitly. Without that line `JxlGetDefaultCms()` is
+an undefined reference.
+
+### Auto-exposure only applies to HDR
+
+libjxl reports `intensity_target = 255` for SDR content. Feeding that to the
+BT.2408 203-nit rule darkened every ordinary photo by a third of a stop. An
+image whose range the display can already show is returned at exactly 0 EV and
+a white point of 1.0, which makes the tone curve a provable identity.
+`tests/jxl_image_test.cc` asserts that exactly, not approximately.
+
 ## Four things the build taught, all non-obvious
 
 1. **libjxl must be `-O2` even in Debug.** Gradle's debug variant sets

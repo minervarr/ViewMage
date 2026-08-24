@@ -178,6 +178,14 @@ target_link_libraries(viewmage PRIVATE
     # and the -static suffixed names belong to an older layout.
     jxl_dec
     jxl_threads
+    # jxl_cms is a SEPARATE target and jxl_dec does not link it
+    # (lib/jxl.cmake:226-229 links jxl_base only, while the full `jxl` target
+    # at :219 does link it). JxlGetDefaultCms() lives there, so without this
+    # line the decoder builds and then fails to link the moment colour
+    # management is used -- and WITHOUT colour management libjxl hands back the
+    # file's own values untransformed, which is what made HDR photos look
+    # washed out.
+    jxl_cms
     android
     log
     vulkan

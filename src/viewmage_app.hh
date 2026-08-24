@@ -53,8 +53,12 @@ private:
     enum class State { kLoading, kReady, kError };
 
     void loadFromSource();          // decode + upload; sets state_
-    bool uploadTexture();           // pixels_ → GPU; false on failure
+    bool uploadTexture();           // pixels_ → GPU, degrading if it must
     void releaseTexture();
+    // Drop the decoded pixels but keep everything we learned about them. At
+    // 16 bytes a pixel this is the largest allocation in the app by two orders
+    // of magnitude, and it is dead weight the moment the GPU has a copy.
+    void releasePixels();
     void draw();
     void syncViewport();
 
@@ -69,9 +73,20 @@ private:
     std::unique_ptr<Host> host_;
     std::unique_ptr<Renderer> renderer_;
 
-    std::vector<uint8_t> source_;   // compressed, kept for a re-decode on resize
-    JxlImage             pixels_;   // decoded RGBA, survives surface loss
+    // Compressed bytes, kept for the whole session. They are a few megabytes
+    // against the decoded buffer's few hundred, which is what makes "free the
+    // pixels and decode again if the surface comes back" the cheap option.
+    std::vector<uint8_t> source_;
+    JxlImage             pixels_;   // .linear is freed after upload; the rest stays
     TextureHandle        texture_ = kInvalidTexture;
+
+    // ── View state for the tone pipeline ────────────────────────────────────
+    // Exposure in stops. Starts at the decoder's auto value and is what the
+    // slider moves. The texture never changes; only a push constant does.
+    float    ev_       = 0.0f;
+    ToneMode toneMode_ = ToneMode::kPassthrough;
+    float    white_    = 1.0f;
+    bool     clipWarn_ = false;
 
     ViewTransform view_;
     State         state_   = State::kLoading;

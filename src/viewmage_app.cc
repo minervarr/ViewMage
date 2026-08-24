@@ -18,6 +18,26 @@ constexpr double kTapMaxSeconds  = 0.35;
 constexpr double kDoubleTapGap   = 0.35;
 constexpr float  kDoubleTapSlop  = 60.0f;
 
+// IEEE binary32 -> binary16. Only used by the memory fallback, so it is
+// written for clarity rather than speed: if we are here at all, an allocation
+// has already failed and one pass over the image is not the problem.
+uint16_t to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0) return (uint16_t)sign;                       // underflow -> +/-0
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);          // overflow  -> +/-inf
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+float srgb_encode(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return x <= 0.0031308f ? x * 12.92f
+                           : 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+}
+
 float distance(float ax, float ay, float bx, float by) {
     const float dx = ax - bx, dy = ay - by;
     return std::sqrt(dx * dx + dy * dy);
@@ -105,25 +125,118 @@ void ViewMageApp::loadFromSource() {
                  maxDim, pixels_.downsampleFactor, pixels_.w, pixels_.h);
     }
 
+    // The decoder worked out what this image needs; adopt it before the first
+    // frame so the picture is right the instant it appears rather than being
+    // corrected a frame later.
+    ev_    = pixels_.autoEv;
+    white_ = pixels_.white;
+    // kRolloff only where there is something to roll off. For an ordinary SDR
+    // photo white_ is 1.0 and the curve is an exact identity, but going through
+    // kPassthrough instead keeps that case provably byte-identical to before.
+    const bool needsTone = pixels_.hdrTransfer || pixels_.widePrimaries ||
+                           pixels_.bitsPerSample > 8 || pixels_.exponentBits > 0 ||
+                           white_ > 1.0f || std::fabs(ev_) > 0.01f;
+    toneMode_ = needsTone ? ToneMode::kRolloff : ToneMode::kClip;
+
     if (!uploadTexture()) {
         state_   = State::kError;
         message_ = "Not enough graphics memory";
         return;
     }
+    releasePixels();
 
     view_.setImage((int)pixels_.w, (int)pixels_.h);
     syncViewport();
     view_.fit();
     state_ = State::kReady;
-    VCE_LOGI("ViewMage", "showing %ux%u", pixels_.w, pixels_.h);
+    VCE_LOGI("ViewMage", "showing %ux%u  transfer=%s primaries=%s  autoEV=%.2f white=%.2f",
+             pixels_.w, pixels_.h,
+             pixels_.transferName.empty() ? "?" : pixels_.transferName.c_str(),
+             pixels_.primariesName.empty() ? "?" : pixels_.primariesName.c_str(),
+             ev_, white_);
 }
 
+// Upload at the best precision this device will actually accept, and SAY when
+// it is not the best one.
+//
+// The chain is full float -> half float -> 8-bit, and each step is a real
+// concession: full float loses nothing, half float loses about a twentieth of
+// an 8-bit code step, and 8-bit loses the range that this whole feature exists
+// to preserve -- at which point exposure has to be baked in on the CPU and the
+// slider stops being able to reveal anything.
+//
+// Degrading silently would be the worst option available: the viewer would
+// still show a picture, and the user would have no way to know the data behind
+// it was gone. So every step down adds a diagnostic.
 bool ViewMageApp::uploadTexture() {
-    if (!renderer_ || !pixels_.ok()) return false;
+    if (!renderer_ || !pixels_.ok() || pixels_.linear.empty()) return false;
     releaseTexture();
-    texture_ = renderer_->create_texture(pixels_.rgba.data(), pixels_.w, pixels_.h,
-                                         /*mips=*/false);
-    return texture_ != kInvalidTexture;
+
+    const size_t texels = (size_t)pixels_.w * pixels_.h;
+
+    // 1. Full float — what was asked for, and what loses nothing.
+    texture_ = renderer_->create_texture(
+        reinterpret_cast<const uint8_t*>(pixels_.linear.data()),
+        pixels_.w, pixels_.h, /*mips=*/false, TextureFormat::RGBA32F);
+    if (texture_ != kInvalidTexture) return true;
+    VCE_LOGI("ViewMage", "RGBA32F upload failed; trying half float");
+
+    // 2. Half float — still linear, still unclipped, still fully explorable.
+    try {
+        std::vector<uint16_t> half(texels * 4);
+        for (size_t i = 0; i < half.size(); ++i) half[i] = to_half(pixels_.linear[i]);
+        texture_ = renderer_->create_texture(
+            reinterpret_cast<const uint8_t*>(half.data()),
+            pixels_.w, pixels_.h, /*mips=*/false, TextureFormat::RGBA16F);
+    } catch (const std::bad_alloc&) {
+        texture_ = kInvalidTexture;
+    }
+    if (texture_ != kInvalidTexture) {
+        pixels_.notes.push_back(Diagnostic{
+            DiagCode::kPrecisionReduced, DiagLevel::kNotice,
+            "Held at reduced precision",
+            "There was not enough graphics memory to keep this photo at full "
+            "precision, so it is held at half precision instead. The difference "
+            "is far below what this screen can show, and the exposure slider "
+            "still reaches the whole range."});
+        return true;
+    }
+    VCE_LOGI("ViewMage", "RGBA16F upload failed; falling back to 8-bit");
+
+    // 3. Eight bits, exposure and tone curve baked in on the CPU. The picture
+    //    survives; the ability to explore beyond it does not.
+    try {
+        std::vector<uint8_t> bytes(texels * 4);
+        const float gain = std::exp2(ev_);
+        for (size_t i = 0; i < texels; ++i) {
+            const float* p = &pixels_.linear[i * 4];
+            for (int c = 0; c < 3; ++c)
+                bytes[i * 4 + c] = (uint8_t)std::lround(srgb_encode(p[c] * gain) * 255.0f);
+            bytes[i * 4 + 3] = (uint8_t)std::lround(std::clamp(p[3], 0.0f, 1.0f) * 255.0f);
+        }
+        texture_ = renderer_->create_texture(bytes.data(), pixels_.w, pixels_.h,
+                                             /*mips=*/false, TextureFormat::RGBA8_UNORM);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    if (texture_ == kInvalidTexture) return false;
+
+    // The texture is now display-referred, so the shader must NOT tone-map it
+    // a second time.
+    toneMode_ = ToneMode::kPassthrough;
+    pixels_.notes.push_back(Diagnostic{
+        DiagCode::kPrecisionReduced, DiagLevel::kWarning,
+        "Extra range could not be kept",
+        "This device did not have enough graphics memory to hold this photo's "
+        "full range, so it has been flattened to what the screen shows. The "
+        "exposure control cannot reveal anything beyond this view."});
+    return true;
+}
+
+void ViewMageApp::releasePixels() {
+    // swap-with-empty, not clear(): clear() keeps the capacity, which is the
+    // entire several hundred megabytes we are trying to give back.
+    std::vector<float>().swap(pixels_.linear);
 }
 
 void ViewMageApp::releaseTexture() {
@@ -141,11 +254,20 @@ void ViewMageApp::onSurfaceLost() {
 bool ViewMageApp::onSurfaceRecreated() {
     surfaceOk_ = true;
     syncViewport();
-    if (state_ == State::kReady || pixels_.ok()) {
-        if (!uploadTexture()) {
-            state_   = State::kError;
-            message_ = "Not enough graphics memory";
-        }
+
+    // The decoded pixels were handed back after the first upload, so there is
+    // nothing in RAM to re-upload — decode again from the compressed source.
+    //
+    // That is the deliberate trade for this format: at 16 bytes a pixel,
+    // keeping the buffer resident against the chance of a surface loss costs
+    // hundreds of megabytes for the entire time the app is open, while
+    // decoding again costs a fraction of a second on the rare occasion it
+    // actually happens. The user's own exposure is preserved across it, which
+    // is the part they would notice.
+    if (state_ == State::kReady) {
+        const float savedEv = ev_;
+        loadFromSource();
+        if (state_ == State::kReady) ev_ = savedEv;
     }
     dirty_ = true;
     return true;
@@ -266,11 +388,16 @@ void ViewMageApp::draw() {
     canvas.clear(kBackground);
 
     if (state_ == State::kReady && texture_ != kInvalidTexture) {
+        // Exposure is a view parameter, not a property of the image: it rides
+        // to the GPU as four floats in a push constant, so dragging the slider
+        // never re-decodes and never re-uploads.
+        canvas.setImageTone(std::exp2(ev_), toneMode_, white_, clipWarn_);
         const ViewTransform::Quad q = view_.quad();
         // Full-screen coordinates deliberately, NOT the inset content box: a
         // photo should run under a display cutout rather than be letterboxed
         // away from it. The cutout is glass over the picture, not a margin.
         canvas.imageFg(texture_, q.x, q.y, q.w, q.h);
+        canvas.clearImageTone();   // the error text below is not an image
     } else if (state_ == State::kError) {
         const float size = std::max(28.0f, canvas.w() * 0.045f);
         canvas.textCentered(message_, canvas.left() + canvas.w() * 0.5f,

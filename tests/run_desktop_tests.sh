@@ -18,11 +18,11 @@ g++ -std=c++17 -O1 -Wall -o "$OUT/view_transform_test" \
 "$OUT/view_transform_test"
 
 echo "== jxl_image_test =="
-if ! pkg-config --exists libjxl libjxl_threads; then
+if ! pkg-config --exists libjxl libjxl_threads libjxl_cms; then
     echo "SKIPPED: no system libjxl (install it, or build thirdparty/libjxl for the host)"
     exit 0
 fi
 g++ -std=c++17 -O1 -Wall -o "$OUT/jxl_image_test" \
     jxl_image_test.cc ../src/jxl_image.cc \
-    $(pkg-config --cflags --libs libjxl libjxl_threads)
+    $(pkg-config --cflags --libs libjxl libjxl_threads libjxl_cms)
 "$OUT/jxl_image_test" .

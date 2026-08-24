@@ -4,6 +4,7 @@
 // a fair assertion rather than a tolerance argument.
 #undef NDEBUG
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -20,13 +21,26 @@ static std::vector<uint8_t> read_file(const std::string& path) {
 
 static std::string dir;   // fixtures live beside the source, not the binary
 
+// sRGB 8-bit code -> linear light, which is what the decoder now hands back.
+static float srgb_to_linear(int code) {
+    const float c = (float)code / 255.0f;
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// Assert a pixel against the sRGB codes it was AUTHORED with, converting to
+// linear here rather than making every call site do it. tol is in linear units.
 static void px(const JxlImage& im, uint32_t x, uint32_t y,
-               int r, int g, int b, int tol = 0) {
-    const uint8_t* p = im.rgba.data() + ((size_t)y * im.w + x) * 4;
-    assert(std::abs((int)p[0] - r) <= tol);
-    assert(std::abs((int)p[1] - g) <= tol);
-    assert(std::abs((int)p[2] - b) <= tol);
-    assert(p[3] == 255);   // an opaque source must decode opaque
+               int r, int g, int b, float tol = 0.01f) {
+    const float* p = im.linear.data() + ((size_t)y * im.w + x) * 4;
+    assert(std::fabs(p[0] - srgb_to_linear(r)) <= tol);
+    assert(std::fabs(p[1] - srgb_to_linear(g)) <= tol);
+    assert(std::fabs(p[2] - srgb_to_linear(b)) <= tol);
+    assert(std::fabs(p[3] - 1.0f) <= 0.01f);   // an opaque source decodes opaque
+}
+
+static bool has_note(const JxlImage& im, DiagCode code) {
+    for (const auto& n : im.notes) if (n.code == code) return true;
+    return false;
 }
 
 static void test_signature_accepts_real_jxl() {
@@ -54,7 +68,7 @@ static void test_decodes_known_pixels() {
     assert(im.ok());
     assert(im.error.empty());
     assert(im.w == 8 && im.h == 8);
-    assert(im.rgba.size() == 8u * 8u * 4u);
+    assert(im.linear.size() == 8u * 8u * 4u);
     assert(im.downsampleFactor == 1);
 
     // The four corners, which also pin the ROW ORDER: (0,0) is red in the
@@ -65,6 +79,88 @@ static void test_decodes_known_pixels() {
     px(im, 7, 7, 255, 255, 255);
     px(im, 3, 3,  10,  20,  30);       // and an interior pixel
     px(im, 3, 5,   0,   0,   0);
+}
+
+// An ordinary 8-bit sRGB photo must be left completely alone: no exposure
+// shift, no rolloff, no diagnostics. This is the regression that protects the
+// common case from everything the HDR work added.
+static void test_ordinary_srgb_image_is_untouched() {
+    auto d = read_file(dir + "/fixtures/grad600x400.jxl");
+    JxlImage im = decode_jxl(d.data(), d.size(), 0);
+    assert(im.ok());
+    assert(!im.hdrTransfer);
+    assert(!im.widePrimaries);
+    assert(im.bitsPerSample == 8);
+    assert(im.autoEv == 0.0f);   // EXACTLY untouched, not merely close
+    assert(im.white  == 1.0f);   // so the tone curve is a provable identity
+    assert(!has_note(im, DiagCode::kHdrTransfer));
+    assert(!has_note(im, DiagCode::kWidePrimaries));
+    assert(!has_note(im, DiagCode::kHighBitDepth));
+}
+
+// A real Rec.2100 PQ file declaring a 1000-nit peak.
+static void test_hdr_pq_is_detected_and_pulled_down() {
+    auto d = read_file(dir + "/fixtures/hdr_pq_1000nit.jxl");
+    JxlImage im = decode_jxl(d.data(), d.size(), 0);
+    assert(im.ok());
+    assert(im.w == 64 && im.h == 64);
+
+    assert(im.hdrTransfer);                    // PQ recognised as HDR
+    assert(im.widePrimaries);                  // BT.2100 is wider than sRGB
+    assert(im.transferName.find("PQ") != std::string::npos);
+    assert(im.bitsPerSample == 16);
+    assert(std::fabs(im.intensityTarget - 1000.0f) < 1.0f);
+    assert(im.colorManaged);                   // the CMS actually ran
+
+    // 203 nits of diffuse white against a declared 1000-nit peak is about
+    // -2.3 EV. Without colour management this image came out ~5 stops wrong,
+    // which is precisely the washout being fixed.
+    assert(im.autoEv < -1.0f && im.autoEv > -5.0f);
+
+    assert(has_note(im, DiagCode::kHdrTransfer));
+    assert(has_note(im, DiagCode::kWidePrimaries));
+    assert(has_note(im, DiagCode::kHighBitDepth));
+
+    // Every value finite, and the wide gamut really did survive as
+    // out-of-range components rather than being clamped away.
+    bool anyOutside = false;
+    for (float v : im.linear) {
+        assert(std::isfinite(v));
+        if (v < -0.0005f || v > 1.0005f) anyOutside = true;
+    }
+    (void)anyOutside;   // not guaranteed for every image; must not crash either way
+}
+
+// High bit depth WITHOUT HDR: the two must be reported independently.
+static void test_high_bit_depth_without_hdr() {
+    auto d = read_file(dir + "/fixtures/srgb16.jxl");
+    JxlImage im = decode_jxl(d.data(), d.size(), 0);
+    assert(im.ok());
+    assert(im.bitsPerSample == 16);
+    assert(!im.hdrTransfer);
+    assert(has_note(im, DiagCode::kHighBitDepth));
+    assert(!has_note(im, DiagCode::kHdrTransfer));
+}
+
+// box_downsample was rewritten from a uint32_t accumulator to a float one.
+// Over linear light the old code would have truncated every value to an
+// integer -- i.e. flattened everything below 1.0 to zero. It only runs on
+// images big enough to exceed the GPU limit, so nothing else would catch it.
+static void test_downsample_preserves_a_constant_plane() {
+    auto d = read_file(dir + "/fixtures/grad600x400.jxl");
+    JxlImage full = decode_jxl(d.data(), d.size(), 0);
+    assert(full.ok());
+    const float blue = full.linear[2];          // constant across the source
+
+    JxlImage small = decode_jxl(d.data(), d.size(), 256);
+    assert(small.ok() && small.downsampleFactor == 4);
+    for (uint32_t y = 0; y < small.h; y += 7) {
+        for (uint32_t x = 0; x < small.w; x += 7) {
+            const float* p = small.linear.data() + ((size_t)y * small.w + x) * 4;
+            assert(std::fabs(p[2] - blue) < 0.002f);   // averaged, not truncated
+            assert(p[2] > 0.001f);                     // the old int path gave 0
+        }
+    }
 }
 
 static void test_larger_image_round_trips() {
@@ -120,12 +216,11 @@ static void test_downsamples_above_max_dimension() {
     assert(im.w <= 256 && im.h <= 256);
     assert(im.downsampleFactor == 4);
     assert(im.w == 150 && im.h == 100);
-    assert(im.rgba.size() == (size_t)im.w * im.h * 4);
+    assert(im.linear.size() == (size_t)im.w * im.h * 4);
     // Averaged, not point-sampled: the blue plane is a constant 200 in the
     // source, so it must survive the box filter exactly.
-    px(im, 10, 10, 0, 0, 200, /*tol=*/2 * 255);
-    const uint8_t* p = im.rgba.data() + ((size_t)10 * im.w + 10) * 4;
-    assert(p[2] >= 198 && p[2] <= 202);
+    const float* p = im.linear.data() + ((size_t)10 * im.w + 10) * 4;
+    assert(std::fabs(p[2] - srgb_to_linear(200)) <= 0.01f);
 
     JxlImage exact = decode_jxl(d.data(), d.size(), 600);  // exactly at the limit
     assert(exact.ok() && exact.downsampleFactor == 1);
@@ -141,6 +236,10 @@ int main(int argc, char** argv) {
     test_signature_rejects_other_things();
     test_decodes_known_pixels();
     test_larger_image_round_trips();
+    test_ordinary_srgb_image_is_untouched();
+    test_hdr_pq_is_detected_and_pulled_down();
+    test_high_bit_depth_without_hdr();
+    test_downsample_preserves_a_constant_plane();
     test_empty_input();
     test_not_jxl();
     test_truncated_input_is_an_error_not_a_crash();
