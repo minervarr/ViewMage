@@ -63,6 +63,7 @@ private:
     void releasePixels();
     void draw();
     void syncViewport();
+    void refreshHeadroom();         // re-ask the display; it is a live value
 
     // Gesture state. Deliberately here and not in app_shell: a slop is a
     // property of a touch screen, but "two fingers mean zoom" is a property of
@@ -93,7 +94,8 @@ private:
     // asked for: the request can be silently refused, and a viewer that assumed
     // otherwise would roll its highlights toward headroom that is not there.
     bool  hdr_      = false;
-    float headroom_ = 1.0f;   // multiple of SDR white; 1.0 == none
+    float headroom_ = 1.0f;   // multiple of SDR white; 1.0 == none. LIVE — see
+                              // refreshHeadroom(); it moves with the brightness.
     bool     clipWarn_ = false;
 
     ViewTransform view_;

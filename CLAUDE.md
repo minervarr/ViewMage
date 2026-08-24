@@ -78,12 +78,19 @@ ViewMage requests `OutputTarget::ExtendedLinearScrgb` and then asks
 the driver, the compositor, or a window that was never put into HDR colour
 mode, and none of those say so.
 
-Verified on an S23 Ultra (SM-S918B): the driver enumerates 68 surface formats,
-and the one taken is `R16G16B16A16_SFLOAT` +
+Verified on an S23 Ultra (SM-S918B, API 36): the driver enumerates 68 surface
+formats, and the one taken is `R16G16B16A16_SFLOAT` +
 `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` (format 97, colorspace 1000104002).
-So FP16-extended-linear does exist on Samsung, and PQ is not the only Android
-option — which answers two of the three open questions in vk_canvas's
-`USAGE_hdr_output.md`. Reported headroom is **2.22x** SDR white.
+So FP16-extended-linear exists on **this** phone and PQ is not the only Android
+option. That is one device, not a generation sweep — vk_canvas's
+`USAGE_hdr_output.md` keeps its third open question open for that reason.
+
+**`setColorMode` is not what makes the format selection work.** Measured by
+flipping the opt-in meta-data off: without the HDR colour mode the driver still
+advertises the same 68 pairs, still selects format 97, still reports `hdr=1`.
+The call is kept because it is what tells the compositor to treat the surface
+as HDR — a different question, and one that experiment does not answer. Do not
+read it as evidence the call is unnecessary.
 
 **Not `Hdr10PQ`, deliberately.** Both are real HDR targets, but under PQ the
 fixed-function blend mixes PQ code values by a coverage weight, and PQ is steep
@@ -104,11 +111,24 @@ ceiling it also overshot). On a device that looked like coloured speckle over
 every specular highlight. With the clamp, an image that fits the panel passes
 through as an exact identity.
 
-**Where the numbers come from.** `headroom` is not guessed: app_shell reads
-`Display.getHdrCapabilities().getDesiredMaxLuminance()` and divides by BT.2408
-graphics white (203). Desired, not maximum — the maximum is a peak the panel
-sustains over a small window only, and mapping a whole image to it is how HDR
-gets a reputation for being painful to look at.
+**Where the numbers come from, and why they move.** `headroom` is not guessed.
+app_shell prefers `Display.getHdrSdrRatio()` (API 34+), which is a **live**
+measurement: SDR white is whatever the system is currently driving the panel
+at, so the same screen has real headroom in a dark room and almost none
+outdoors. Where that is unavailable it falls back to
+`getHdrCapabilities().getDesiredMaxLuminance() / 203` — desired, not maximum,
+because the maximum is a peak the panel sustains over a small window only, and
+mapping a whole image to it is how HDR gets a reputation for being painful to
+look at.
+
+On the S23, `isHdrSdrRatioAvailable()` returns **false**, so the static
+fallback is what actually runs: 450 nits / 203 = **2.22x**. The live path is
+written but has not executed on any device here — say so rather than implying
+it is exercised.
+
+Because the value is live, `refreshHeadroom()` re-reads it on
+`onSurfaceRecreated()` — Android's way of handing the app back after a trip
+through the background, which is exactly when the brightness may have changed.
 
 ### Auto-exposure only applies to HDR
 
@@ -181,9 +201,11 @@ that library's stated test, "could a drawing program use it?"
 ## Testing honestly
 
 `tests/` runs on a desktop and covers the math and the decoder, including
-truncated and corrupt input. The tone curve is tested in vk_canvas
-(`output_target_test`), not here: `rolloffCurve()` is the C++ authority and
-`image_frag.slang` mirrors it, on the same terms as the PQ constants. **No
+truncated and corrupt input. The tone curve's authority is `rolloffCurve()` in
+vk_canvas, mirrored by `image_frag.slang` on the same terms as the PQ
+constants; `run_desktop_tests.sh` builds and runs vk_canvas's
+`output_target_test` too, because vk_canvas only builds its own tests from the
+Windows build and a test nobody runs is a test that rots. **No
 shader has been executed under test** — the shaders compile and pass
 `spirv-val`, which is not the same as running.
 

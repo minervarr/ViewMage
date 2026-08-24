@@ -17,6 +17,24 @@ g++ -std=c++17 -O1 -Wall -o "$OUT/view_transform_test" \
     view_transform_test.cc ../src/view_transform.cc
 "$OUT/view_transform_test"
 
+# The tone curve lives in vk_canvas, and so does its test — but vk_canvas only
+# builds its tests from the WINDOWS build, so on a Linux dev machine nothing
+# ever ran it. A test nobody runs is a test that rots, and this one guards the
+# claim that an SDR image is bit-identical through the HDR-capable curve.
+# It is pure math over vulkan.h types: no GPU, no device, no Vulkan loader.
+echo "== output_target_test (vk_canvas) =="
+VKC=../framework/vk_canvas
+if [ ! -f "$VKC/core/output_target.cc" ]; then
+    echo "SKIPPED: vk_canvas submodule not initialised"
+elif ! echo '#include <vulkan/vulkan.h>' | g++ -x c++ -fsyntax-only - 2>/dev/null; then
+    echo "SKIPPED: no Vulkan headers (install vulkan-headers)"
+else
+    g++ -std=c++17 -O1 -Wall -o "$OUT/output_target_test" \
+        "$VKC/core/tests/output_target_test.cc" "$VKC/core/output_target.cc" \
+        -I "$VKC/core"
+    "$OUT/output_target_test"
+fi
+
 echo "== jxl_image_test =="
 if ! pkg-config --exists libjxl libjxl_threads libjxl_cms; then
     echo "SKIPPED: no system libjxl (install it, or build thirdparty/libjxl for the host)"

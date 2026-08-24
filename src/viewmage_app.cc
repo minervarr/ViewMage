@@ -75,7 +75,7 @@ bool ViewMageApp::create() {
     // and none of those say so. hdrActive() is the only honest answer, and the
     // headroom is meaningless without it.
     hdr_ = renderer_->hdrActive();
-    headroom_ = hdr_ ? activity::display_hdr_headroom() : 1.0f;
+    refreshHeadroom();
     VCE_LOGI("ViewMage", "output target: %s (hdr=%s) headroom=%.2fx",
              outputTargetName(renderer_->activeTarget()), hdr_ ? "yes" : "no", headroom_);
 
@@ -275,6 +275,19 @@ void ViewMageApp::releaseTexture() {
     texture_ = kInvalidTexture;
 }
 
+// The panel's headroom is a LIVE measurement, not a fixed capability: on API
+// 34+ it is Display.getHdrSdrRatio(), and SDR white is whatever the system is
+// currently driving the screen at. The same phone has room for a bright
+// highlight in a dark room and almost none outdoors, so a value read once at
+// startup goes stale the moment the user walks through a door.
+//
+// Re-read where it is cheap and where it can have changed: surface recreation
+// is how Android hands the app back after a trip through the background, which
+// is exactly when the brightness is likely to be different.
+void ViewMageApp::refreshHeadroom() {
+    headroom_ = hdr_ ? activity::display_hdr_headroom() : 1.0f;
+}
+
 void ViewMageApp::onSurfaceLost() {
     // The handle belongs to a device that is going away. Drop it, keep the
     // pixels: pixels_ is the expensive thing and it is still perfectly good.
@@ -284,6 +297,7 @@ void ViewMageApp::onSurfaceLost() {
 
 bool ViewMageApp::onSurfaceRecreated() {
     surfaceOk_ = true;
+    refreshHeadroom();
     syncViewport();
 
     // The decoded pixels were handed back after the first upload, so there is
