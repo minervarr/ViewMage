@@ -5,6 +5,9 @@ app/build/
 .gradle/
 local.properties
 
+# The release signing key (points at Matrix_Player's bruno.jks).
+keystore.properties
+
 # Reading reference only — oupson/jxlviewer, not a dependency of this project.
 # Cloned by hand into reference/ to read its libjxl wiring; nothing here builds
 # against it and nothing here links it.

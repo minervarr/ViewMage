@@ -71,6 +71,45 @@ fragment shader after exposure and the tone curve.
 `CMakeLists.txt` links it explicitly. Without that line `JxlGetDefaultCms()` is
 an undefined reference.
 
+### HDR output: asked for, granted, and verified on a panel
+
+ViewMage requests `OutputTarget::ExtendedLinearScrgb` and then asks
+`Renderer::hdrActive()` what it actually got — the request can be refused by
+the driver, the compositor, or a window that was never put into HDR colour
+mode, and none of those say so.
+
+Verified on an S23 Ultra (SM-S918B): the driver enumerates 68 surface formats,
+and the one taken is `R16G16B16A16_SFLOAT` +
+`VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` (format 97, colorspace 1000104002).
+So FP16-extended-linear does exist on Samsung, and PQ is not the only Android
+option — which answers two of the three open questions in vk_canvas's
+`USAGE_hdr_output.md`. Reported headroom is **2.22x** SDR white.
+
+**Not `Hdr10PQ`, deliberately.** Both are real HDR targets, but under PQ the
+fixed-function blend mixes PQ code values by a coverage weight, and PQ is steep
+enough that mixing code values is not mixing the luminances they stand for.
+Antialiased edges and the letterbox come out wrong in a way that reads as bad
+antialiasing rather than bad colour. scRGB blends in linear light.
+
+**The tone curve rolls toward the panel, not toward SDR white.** vk_canvas's
+`rolloffCurve()` takes a ceiling; ViewMage passes the display's headroom, so
+highlights use the range the panel actually has. autoEV is kept — pinning 0 EV
+because the panel is capable opens a dim file dim and calls it honesty.
+
+The ceiling is clamped to the image's own white point inside the curve, and
+that clamp is load-bearing rather than defensive: without it the curve
+extrapolates instead of compressing, and a photo whose white point sits below
+the panel's headroom gets its highlights multiplied (measured: 2.24x, over a
+ceiling it also overshot). On a device that looked like coloured speckle over
+every specular highlight. With the clamp, an image that fits the panel passes
+through as an exact identity.
+
+**Where the numbers come from.** `headroom` is not guessed: app_shell reads
+`Display.getHdrCapabilities().getDesiredMaxLuminance()` and divides by BT.2408
+graphics white (203). Desired, not maximum — the maximum is a peak the panel
+sustains over a small window only, and mapping a whole image to it is how HDR
+gets a reputation for being painful to look at.
+
 ### Auto-exposure only applies to HDR
 
 libjxl reports `intensity_target = 255` for SDR content. Feeding that to the
@@ -127,6 +166,13 @@ that library's stated test, "could a drawing program use it?"
   the activity was launched to open. Native code cannot do this itself; a
   `content://` URI has no file behind it and the read grant belongs to the
   Intent, so only a `ContentResolver` reaches it.
+- `maybeRequestHdrColorMode()` + `activity::display_hdr_headroom()`: an
+  **opt-in** HDR window, requested through an `io.nava.appshell.HDR`
+  `<meta-data>` and default off, plus the display's headroom. `setColorMode`
+  must happen in `onCreate`, before the surface exists, because the colour mode
+  can change which `VkSurfaceFormatKHR` pairs the driver enumerates. Native
+  code cannot read `Display.HdrCapabilities` — there is no NDK equivalent, and
+  the alternative is hardcoding a number and calling it headroom.
 - `AppView::onPointerDown/Move/Up(pointerId, x, y)` + `AndroidHost` iterating
   every pointer index. Pinch is unreachable otherwise: the host previously read
   `AMotionEvent_getX(event, 0)` and nothing else. The single-pointer synthesis
@@ -135,7 +181,13 @@ that library's stated test, "could a drawing program use it?"
 ## Testing honestly
 
 `tests/` runs on a desktop and covers the math and the decoder, including
-truncated and corrupt input. **Rendering is verified visually on a device** —
+truncated and corrupt input. The tone curve is tested in vk_canvas
+(`output_target_test`), not here: `rolloffCurve()` is the C++ authority and
+`image_frag.slang` mirrors it, on the same terms as the PQ constants. **No
+shader has been executed under test** — the shaders compile and pass
+`spirv-val`, which is not the same as running.
+
+**Rendering is verified visually on a device** —
 vk_canvas itself has no automated rendering tests, and this project does not
 claim one it does not have. Two-finger pinch has not been machine-verified
 either: `adb shell input` cannot produce a real multi-pointer gesture. Say so

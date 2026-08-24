@@ -10,6 +10,8 @@
 #include "app_view.hh"
 #include "host.hh"
 #include "canvas.hh"
+#include "activity_bridge.hh"
+#include "output_target.hh"
 #include "renderer.hh"
 #include "texture.hh"
 
@@ -86,6 +88,12 @@ private:
     float    ev_       = 0.0f;
     ToneMode toneMode_ = ToneMode::kPassthrough;
     float    white_    = 1.0f;
+
+    // What the swapchain actually IS, resolved once in create(). Not what was
+    // asked for: the request can be silently refused, and a viewer that assumed
+    // otherwise would roll its highlights toward headroom that is not there.
+    bool  hdr_      = false;
+    float headroom_ = 1.0f;   // multiple of SDR white; 1.0 == none
     bool     clipWarn_ = false;
 
     ViewTransform view_;

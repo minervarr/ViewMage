@@ -59,7 +59,26 @@ double ViewMageApp::nowSeconds() const {
 
 bool ViewMageApp::create() {
     if (!host_ || !host_->init(this)) return false;
-    renderer_ = std::make_unique<Renderer>(host_->surfaceProvider(), host_->assetReader());
+    // ExtendedLinearScrgb, deliberately, and NOT Hdr10PQ. Both are real HDR
+    // targets and vk_canvas will fall back to SDR if neither is available, but
+    // under PQ the fixed-function blend mixes PQ code values by a coverage
+    // weight -- and PQ is steep enough that mixing code values is not mixing
+    // the luminances they stand for. Antialiased edges and the letterbox come
+    // out wrong in a way that reads as bad antialiasing rather than bad colour.
+    // scRGB blends in linear light, which is strictly more correct than the SDR
+    // path has ever been. See vk_canvas USAGE_hdr_output.md.
+    renderer_ = std::make_unique<Renderer>(host_->surfaceProvider(), host_->assetReader(),
+                                           /*images=*/4, OutputTarget::ExtendedLinearScrgb);
+
+    // ASK, never assume. The request above can be refused by the driver, by the
+    // compositor, or by the window never having been put into HDR colour mode,
+    // and none of those say so. hdrActive() is the only honest answer, and the
+    // headroom is meaningless without it.
+    hdr_ = renderer_->hdrActive();
+    headroom_ = hdr_ ? activity::display_hdr_headroom() : 1.0f;
+    VCE_LOGI("ViewMage", "output target: %s (hdr=%s) headroom=%.2fx",
+             outputTargetName(renderer_->activeTarget()), hdr_ ? "yes" : "no", headroom_);
+
     syncViewport();
     return true;
 }
@@ -137,6 +156,18 @@ void ViewMageApp::loadFromSource() {
                            pixels_.bitsPerSample > 8 || pixels_.exponentBits > 0 ||
                            white_ > 1.0f || std::fabs(ev_) > 0.01f;
     toneMode_ = needsTone ? ToneMode::kRolloff : ToneMode::kClip;
+
+    // On an HDR swapchain the rolloff knee aims at the panel's headroom rather
+    // than at display white (vk_canvas's rolloffCurve() takes that ceiling).
+    // Nothing here changes on SDR, where the ceiling is 1.0 and the curve is
+    // bit-identical to what the tests already assert.
+    //
+    // autoEV is KEPT. The alternative -- pinning 0 EV because the panel is
+    // capable -- opens a dim file dim and calls it honesty; the exposure exists
+    // so an image lands where it was meant to land, and a display with headroom
+    // does not make that decision wrong. The full float range is still in the
+    // texture either way, so nothing the panel could have shown is discarded
+    // before the exposure control can reach it.
 
     if (!uploadTexture()) {
         state_   = State::kError;
@@ -392,6 +423,10 @@ void ViewMageApp::draw() {
         // to the GPU as four floats in a push constant, so dragging the slider
         // never re-decodes and never re-uploads.
         canvas.setImageTone(std::exp2(ev_), toneMode_, white_, clipWarn_);
+        // Ignored outright on an SDR swapchain, so this is unconditional. On an
+        // HDR one it is what stops clipWarn striping every highlight the panel
+        // can genuinely show -- and what lets the rolloff reach them at all.
+        canvas.setImageHdr(kGraphicsWhiteNits, headroom_);
         const ViewTransform::Quad q = view_.quad();
         // Full-screen coordinates deliberately, NOT the inset content box: a
         // photo should run under a display cutout rather than be letterboxed

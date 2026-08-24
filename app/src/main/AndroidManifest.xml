@@ -20,6 +20,16 @@
                 android:name="android.app.lib_name"
                 android:value="viewmage" />
 
+            <!-- Ask app_shell for an HDR window (AppShellActivity reads this
+                 in onCreate, before the surface exists, because the colour
+                 mode can change which VkSurfaceFormatKHR pairs the driver
+                 enumerates). It is a request: the system may refuse it
+                 silently, so the native side asks Renderer::hdrActive() what
+                 it actually got rather than trusting this line. -->
+            <meta-data
+                android:name="io.nava.appshell.HDR"
+                android:value="true" />
+
             <!-- ViewMage is opened FROM a file manager and has no launcher
                  icon on purpose: an image viewer with no image to view has
                  nothing to show, and a home-screen entry that always says
