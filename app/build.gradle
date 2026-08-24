@@ -1,0 +1,71 @@
+plugins {
+  id 'com.android.application'
+}
+
+android {
+    namespace "io.nava.viewmage"
+
+    compileSdkVersion 37
+    ndkVersion "29.0.14206865"
+
+    defaultConfig {
+        applicationId "io.nava.viewmage"
+        minSdkVersion 26
+        // 34 rather than 35+: Android 15 makes edge-to-edge mandatory at 35,
+        // and this app draws its own fullscreen surface through NativeActivity.
+        targetSdkVersion 34
+        versionCode 1
+        versionName "1.0"
+
+        externalNativeBuild {
+            cmake {
+                // slangc ships with the Vulkan SDK, which VceShaders.cmake
+                // probes $VULKAN_SDK for. There is no Vulkan SDK on this
+                // machine — slang is installed on its own — so the seam that
+                // module already provides for saying so is used instead of
+                // faking a SDK layout.
+                arguments "-DVCE_SLANGC=/opt/shader-slang/bin/slangc"
+
+                // Without this AGP builds every target the CMake project
+                // defines, which for libjxl includes a fuzzer runner and
+                // highway's target-listing tool. EXCLUDE_FROM_ALL does not
+                // stop it, because AGP asks ninja for those targets by name.
+                targets "viewmage"
+            }
+        }
+
+        ndk {
+            // The one ABI this is developed and tested against. x86_64 is a
+            // one-word change here when an emulator needs it; building both
+            // doubles a libjxl compile for no one who is currently running it.
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    // AppShellActivity is app_shell's ONE Java file and it is not compiled by
+    // CMake — it is Gradle's. Without this the JNI lookups silently fail and
+    // readIntentData() becomes a no-op, which for ViewMage means every launch
+    // shows "No image to show".
+    sourceSets {
+        main {
+            java.srcDirs += '../framework/app_shell/platform/android/java'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "../CMakeLists.txt"
+            version "3.22.1+"
+        }
+    }
+
+    lint {
+        disable 'ExpiredTargetSdkVersion'
+    }
+}

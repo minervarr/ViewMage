@@ -1,7 +1,10 @@
 # ViewMage — design
 
 **Date:** 2026-08-23
-**Status:** approved, ready for an implementation plan
+**Status:** implemented and verified on device. Three sections were corrected
+against what the build actually showed — §4 (draw order), §7 (no font is
+needed) and §9 (a fourth limitation, since removed). Each correction is marked
+below.
 
 A JPEG XL image viewer for Android, built on the `app_shell` + `vk_canvas`
 C++ framework, decoding with libjxl.
@@ -108,8 +111,22 @@ std::vector<uint8_t> compressed
     ↓
 Renderer::create_texture(rgba, w, h, mips = false)
     ↓ every dirty frame
-ViewTransform → one ImageDraw quad → Canvas::image() → ImageLayer
+ViewTransform → one ImageDraw quad → Canvas::imageFg() → ImageLayer
 ```
+
+### CORRECTION: the foreground layer, not the background one
+
+The design said `Canvas::image()`. That draws into ImageLayer's BACKGROUND
+pass, which runs before the vector overlay composites — the right place for
+album art sitting behind UI chrome, and the wrong place here. `Canvas::clear()`
+is itself a full-screen overlay rect, so it painted over the photograph
+entirely: the first build on device rendered a correct decode onto a screen
+that showed nothing but background colour.
+
+`imageFg()` and `Renderer::draw()`'s `foregroundImages` put it above the
+overlay instead. The rule the mistake taught: in this engine the background
+image layer is for what UI sits ON, and a viewer's photograph is not that — it
+is the subject, and the only thing that may cover it is nothing.
 
 ### Why not `art_texture.hh`
 
@@ -274,11 +291,19 @@ text. There is no silent failure and no blank screen.
 | libjxl reported a decode error | "Could not decode this image" |
 | decoded, but Vulkan upload failed | "Not enough graphics memory" |
 
-Drawing words requires a font, so `font.otf` is copied into
-`app/src/main/assets/fonts/` from the font engine submodule and
-`Renderer::initMsdf()` is called at startup. That is a real cost in APK size
-for an application whose happy path shows no text at all, and it is accepted:
-the alternative is a viewer that fails by showing nothing.
+### CORRECTION: no font ships, and none is needed
+
+The design accepted an `font.otf` in the APK and a `Renderer::initMsdf()` call
+so that failures could be worded, calling it weight worth paying. It is not
+needed at all: `Canvas`'s constructor takes `const Font* font`, and passing
+`nullptr` selects the STROKE-FALLBACK glyphs built into the font engine —
+which is exactly what vk_canvas's own Android demo does.
+
+So ViewMage ships no font, calls no `initMsdf()`, and compiles no `msdf_*`
+shader. The error line is drawn through the curve path that was already being
+built for `clear()`. The tradeoff the design agonised over turned out not to
+exist, which is the good kind of correction: the cheaper option was also the
+one with fewer parts.
 
 ---
 
@@ -311,5 +336,15 @@ have.
 - **Colour management is whatever libjxl's default sRGB output gives.** Wide
   gamut and HDR JXLs will be shown, but not tone-mapped to the display.
 - **Animated JXL shows its first frame only.**
+
+- **NOT a limitation, but it looked like one:** the first on-device build took
+  **19.5 seconds** to decode a 3060x4080 photo. That was not libjxl and not the
+  full-resolution decode above — Gradle's debug variant configures CMake with
+  `CMAKE_BUILD_TYPE=Debug`, which compiled highway's SIMD kernels at `-O0`.
+  ViewMage's `CMakeLists.txt` now forces `-O2` around libjxl's
+  `add_subdirectory()` in every configuration; the same photo decodes in
+  **0.37 s**, a 52x difference. Worth stating because a codec built at `-O0` is
+  not a slow build of the same program, it is a different one, and the symptom
+  looks exactly like a bad decoder.
 - **Desktop hosts get no pinch**, because a mouse has one pointer. Stated in
   §5b rather than faked.
