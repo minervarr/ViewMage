@@ -16,7 +16,14 @@
 #include "texture.hh"
 
 #include "jxl_image.hh"
+#include "dng_image.hh"
+#include "ai_denoise.hh"
+#include "png_export.hh"
 #include "view_transform.hh"
+
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 class ViewMageApp : public AppView {
 public:
@@ -55,6 +62,31 @@ private:
     enum class State { kLoading, kReady, kError };
 
     void loadFromSource();          // decode + upload; sets state_
+
+    // ── Progressive refinement ──────────────────────────────────────────────
+    //
+    // The neural denoise is tens of seconds on a phone, which is far too long
+    // to hold a blank screen for. So the ordinary develop is shown IMMEDIATELY
+    // and the denoised one replaces it when it is ready. The user gets a
+    // picture at once and a better picture shortly after, instead of a wait.
+    //
+    // Started only for DNGs, only when the model loaded. Everything it touches
+    // is either its own or guarded by `refined_mutex_`; the swap itself happens
+    // on the main thread in pollRefinement(), because uploading a texture is
+    // not something a worker may do.
+    // The POST bar: what it says, and what pressing it does.
+    std::string statusLine() const;
+    void        doExport();
+
+    struct Rect { float x, y, w, h; bool contains(float px, float py) const {
+        return w > 0.0f && px >= x && px <= x + w && py >= y && py <= y + h; } };
+    Rect        export_rect_{0, 0, 0, 0};   // set by draw(), read by the touch
+    bool        exporting_ = false;
+    std::string export_note_;               // shown once a file has been written
+
+    void startRefinement();
+    void pollRefinement();
+    void joinRefinement();          // safe to call twice; called from shutdown
     bool uploadTexture();           // pixels_ → GPU, degrading if it must
     void releaseTexture();
     // Drop the decoded pixels but keep everything we learned about them. At
@@ -80,8 +112,32 @@ private:
     // against the decoded buffer's few hundred, which is what makes "free the
     // pixels and decode again if the surface comes back" the cheap option.
     std::vector<uint8_t> source_;
-    JxlImage             pixels_;   // .linear is freed after upload; the rest stays
+    DecodedImage         pixels_;   // .linear is freed after upload; the rest stays
+
+    // What the sensor said about its own noise, when the file was a DNG that
+    // carried NoiseProfile. Kept rather than consumed: it is the input a
+    // denoiser needs, and a denoiser that has to estimate the noise level
+    // instead of being told it is the difference between cleaning an image and
+    // inventing detail in it.
+    NoiseModel           noise_;
     TextureHandle        texture_ = kInvalidTexture;
+
+    std::vector<uint8_t>         model_bytes_;   // the ONNX file, read on the main
+                                                 // thread, parsed on the worker
+    std::unique_ptr<RawDenoiser> denoiser_;      // built ON the worker thread
+    std::thread                  refine_thread_;
+    std::mutex                   refined_mutex_;
+    DecodedImage                 refined_;       // guarded by refined_mutex_
+    std::atomic<bool>            refined_ready_{false};
+    std::atomic<bool>            refine_abort_{false};
+    std::atomic<float>           refine_progress_{0.0f};
+
+    // The developed pixels are KEPT on the DNG path rather than freed after
+    // upload. They are the largest allocation in the app, and they are also the
+    // only thing "Save PNG" can write without spending another 26 seconds
+    // re-denoising -- for a POST app whose whole purpose is leaving with a file,
+    // that trade is the right way round. See releasePixels().
+    bool                         keep_pixels_ = false;
 
     // ── View state for the tone pipeline ────────────────────────────────────
     // Exposure in stops. Starts at the decoder's auto value and is what the

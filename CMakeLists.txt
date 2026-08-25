@@ -136,11 +136,39 @@ vce_compile_slang(compile_canvas_shaders ${SHADER_OUT}
     overlay_vert overlay_frag image_vert image_frag)
 
 # ── The application ──────────────────────────────────────────────────────────
+# ── ONNX Runtime (prebuilt import, not compiled) ─────────────────────────────
+#
+# Runs the neural raw denoiser (see src/ai_denoise.hh). A PREBUILT .so per ABI,
+# imported rather than built: ORT's own build is a multi-hour cross-compile with
+# its own toolchain requirements, and this is the same binary the camera app
+# already ships and has device-verified.
+#
+# The binary is NOT in git — run tools/fetch_onnxruntime.sh. When it is absent
+# the app still builds and runs; it simply develops without the denoise, which
+# is exactly the fallback path VIEWMAGE_WITH_ORT guards.
+set(ORT_DIR ${REPO_ROOT}/thirdparty/onnxruntime)
+set(VIEWMAGE_HAS_ORT OFF)
+if(EXISTS ${ORT_DIR}/lib/${ANDROID_ABI}/libonnxruntime.so)
+    add_library(onnxruntime SHARED IMPORTED)
+    set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION
+        ${ORT_DIR}/lib/${ANDROID_ABI}/libonnxruntime.so)
+    target_include_directories(onnxruntime INTERFACE ${ORT_DIR}/include)
+    set(VIEWMAGE_HAS_ORT ON)
+else()
+    message(WARNING
+        "thirdparty/onnxruntime is missing — building WITHOUT the neural raw "
+        "denoiser. Run tools/fetch_onnxruntime.sh to enable it.")
+endif()
+
 add_library(viewmage SHARED
     src/android_main.cc
     src/viewmage_app.cc
     src/view_transform.cc
     src/jxl_image.cc
+    src/dng_image.cc
+    src/decoded_image.cc
+    src/ai_denoise.cc
+    src/png_export.cc
 
     # vk_canvas's Android implementations of the platform.hh seams
     # (AndroidSurfaceProvider / AndroidAssetReader). They live in that repo's
@@ -157,6 +185,7 @@ add_dependencies(viewmage compile_font_shaders compile_canvas_shaders)
 
 target_include_directories(viewmage PRIVATE
     ${REPO_ROOT}/src
+    ${REPO_ROOT}/thirdparty/stb           # stb_image_write.h, PNG export
     ${APP_SHELL_NATIVE_APP_GLUE_DIR}
     ${VK_CANVAS_DIR}/platform/android      # android_platform.hh, jni_util.hh
     # libjxl's public headers. Stated here rather than inherited from
@@ -190,6 +219,11 @@ target_link_libraries(viewmage PRIVATE
     log
     vulkan
 )
+
+if(VIEWMAGE_HAS_ORT)
+    target_link_libraries(viewmage PRIVATE onnxruntime)
+    target_compile_definitions(viewmage PRIVATE VIEWMAGE_WITH_ORT)
+endif()
 
 # native_app_glue's entry point is only ever called by the framework, so the
 # linker cannot see that anything uses it.

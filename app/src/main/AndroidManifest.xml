@@ -63,6 +63,32 @@
                 <data android:pathPattern=".*\\..*\\..*\\.jxl" />
                 <data android:pathPattern=".*\\.JXL" />
             </intent-filter>
+
+            <!-- DNG, the format the camera actually writes now. Same two-part
+                 declaration for the same reason: image/x-adobe-dng is the
+                 registered type, but plenty of providers hand a .dng over as
+                 application/octet-stream with only the name to go on. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="image/x-adobe-dng" />
+                <data android:mimeType="image/dng" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.dng" />
+                <data android:pathPattern=".*\\..*\\.dng" />
+                <data android:pathPattern=".*\\..*\\..*\\.dng" />
+                <data android:pathPattern=".*\\.DNG" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>

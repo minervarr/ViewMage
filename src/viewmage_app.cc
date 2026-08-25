@@ -1,5 +1,7 @@
 #include "viewmage_app.hh"
 
+#include "png_export.hh"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -12,6 +14,10 @@ namespace {
 // competes with it, so there is nothing else on screen.
 constexpr Color kBackground{0.06f, 0.06f, 0.07f, 1.0f};
 constexpr Color kMessage   {0.85f, 0.85f, 0.88f, 1.0f};
+constexpr Color kBar       {0.04f, 0.04f, 0.05f, 0.82f};
+constexpr Color kButton    {0.16f, 0.17f, 0.20f, 1.0f};
+constexpr Color kButtonOff {0.10f, 0.10f, 0.12f, 1.0f};
+constexpr Color kMessageOff{0.42f, 0.42f, 0.45f, 1.0f};
 
 constexpr float  kTapSlopPx      = 24.0f;
 constexpr double kTapMaxSeconds  = 0.35;
@@ -48,6 +54,10 @@ float distance(float ax, float ay, float bx, float by) {
 ViewMageApp::ViewMageApp(std::unique_ptr<Host> host) : host_(std::move(host)) {}
 
 ViewMageApp::~ViewMageApp() {
+    // FIRST: the refinement worker captures `this` and reads source_. Tearing
+    // the renderer down under a running decode is a use-after-free that would
+    // only show up as an occasional crash on exit.
+    joinRefinement();
     releaseTexture();
     renderer_.reset();
 }
@@ -59,16 +69,29 @@ double ViewMageApp::nowSeconds() const {
 
 bool ViewMageApp::create() {
     if (!host_ || !host_->init(this)) return false;
-    // ExtendedLinearScrgb, deliberately, and NOT Hdr10PQ. Both are real HDR
-    // targets and vk_canvas will fall back to SDR if neither is available, but
-    // under PQ the fixed-function blend mixes PQ code values by a coverage
-    // weight -- and PQ is steep enough that mixing code values is not mixing
-    // the luminances they stand for. Antialiased edges and the letterbox come
-    // out wrong in a way that reads as bad antialiasing rather than bad colour.
-    // scRGB blends in linear light, which is strictly more correct than the SDR
-    // path has ever been. See vk_canvas USAGE_hdr_output.md.
+    // Hdr10PQ. Both it and ExtendedLinearScrgb are real HDR targets and
+    // vk_canvas falls back to SDR if neither is available, so this is a request
+    // and not an assumption -- see hdrActive() below.
+    //
+    // PQ is chosen because it is the target Android actually grants on a phone:
+    // the 10-bit ST 2084 pair is what surfaces enumerate, and its absolute
+    // luminance means "1000 nits" in the file arrives as 1000 nits on the panel
+    // instead of as a number scaled by whatever the OS thinks SDR white is.
+    //
+    // ACCEPTED CAVEAT, the one scRGB was picked for: under PQ the fixed-function
+    // blend mixes PQ code values by a coverage weight, and PQ is steep enough
+    // that mixing code values is not mixing the luminances they stand for.
+    // Antialiased edges and the letterbox seam are therefore slightly wrong.
+    // That is a sub-pixel error on a viewer whose entire screen is one opaque
+    // photograph over a flat background -- there is almost nothing to blend --
+    // and it is worth paying for correct absolute brightness on the photo
+    // itself. See vk_canvas USAGE_hdr_output.md.
+    //
+    // PQ is BT.2020 primaries, and the decode has to be told so: see
+    // loadFromSource(), which passes activeTarget() down to decode_jxl(). Those
+    // two must agree or every colour is stretched onto the wrong gamut.
     renderer_ = std::make_unique<Renderer>(host_->surfaceProvider(), host_->assetReader(),
-                                           /*images=*/4, OutputTarget::ExtendedLinearScrgb);
+                                           /*images=*/4, OutputTarget::Hdr10PQ);
 
     // ASK, never assume. The request above can be refused by the driver, by the
     // compositor, or by the window never having been put into HDR colour mode,
@@ -88,9 +111,15 @@ void ViewMageApp::run() {
         // Nothing decided before pump() may be trusted after it: pump() is
         // where Android says "your surface is gone". So the draw decision is
         // made entirely below this line.
-        host_->pump(/*haveWork=*/dirty_);
+        // Refinement runs on a worker; while one is in flight we must keep
+        // pumping rather than sleeping in pump(), or the finished image would
+        // sit there unswapped until the user happened to touch the screen.
+        const bool refining = refine_thread_.joinable() && !refined_ready_.load();
+        host_->pump(/*haveWork=*/dirty_ || refining);
         if (host_->quitRequested()) break;
         if (!running_) break;
+
+        pollRefinement();
 
         if (dirty_ && surfaceOk_ && renderer_) {
             draw();
@@ -99,7 +128,182 @@ void ViewMageApp::run() {
     }
 }
 
-void ViewMageApp::shutdown() { running_ = false; }
+void ViewMageApp::shutdown() {
+    running_ = false;
+    joinRefinement();
+}
+
+// ── Progressive refinement ──────────────────────────────────────────────────
+
+void ViewMageApp::joinRefinement() {
+    refine_abort_.store(true);
+    if (refine_thread_.joinable()) refine_thread_.join();
+}
+
+void ViewMageApp::startRefinement() {
+    if (model_bytes_.empty() || refine_thread_.joinable()) return;
+    if (!looks_like_dng(source_.data(), source_.size())) return;
+
+    const uint32_t maxDim = renderer_ ? renderer_->caps().max_image_dim_2d : 0;
+    const WorkingPrimaries prim =
+        (renderer_ && renderer_->activeTarget() == OutputTarget::Hdr10PQ)
+            ? WorkingPrimaries::Bt2100 : WorkingPrimaries::Srgb;
+
+    refined_ready_.store(false);
+    refine_abort_.store(false);
+    VCE_LOGI("ViewMage", "neural denoise: started in the background");
+
+    refine_thread_ = std::thread([this, maxDim, prim] {
+        // Building the session is the expensive half -- on an S23 Ultra it is
+        // minutes, not seconds, which is exactly why it lives on this thread.
+        if (!denoiser_) {
+            const double t0 = nowSeconds();
+            std::string err;
+            denoiser_ = RawDenoiser::load(model_bytes_.data(), model_bytes_.size(), err);
+            if (!denoiser_) {
+                VCE_LOGE("ViewMage", "denoiser unavailable: %s", err.c_str());
+                return;
+            }
+            VCE_LOGI("ViewMage", "denoiser ready (%s) in %.1f s",
+                     denoiser_->provider().c_str(), nowSeconds() - t0);
+        }
+        if (refine_abort_.load()) return;
+        const double t1 = nowSeconds();
+
+        // decode_dng again rather than trying to re-enter the develop halfway:
+        // the develop is a few hundred milliseconds against the denoise's tens
+        // of seconds, and a second full decode is far easier to reason about
+        // than a pipeline that can be resumed from the middle.
+        DecodedImage out = decode_dng(source_.data(), source_.size(), maxDim,
+                                      prim, nullptr, denoiser_.get());
+        if (refine_abort_.load()) return;
+        VCE_LOGI("ViewMage", "neural denoise: %.1f s for %ux%u",
+                 nowSeconds() - t1, out.w, out.h);
+        {
+            std::lock_guard<std::mutex> lock(refined_mutex_);
+            refined_ = std::move(out);
+        }
+        refined_ready_.store(true);
+    });
+}
+
+
+// A cheap local-roughness probe: mean |2c - left - right| on the green channel.
+// It is the ONE number that tells a denoised buffer from a raw-demosaic one at
+// a glance -- measured on this scene, Malvar reads ~0.05 and the neural output
+// ~0.005, a full order of magnitude apart. Sampled, not exhaustive, because it
+// runs on the UI thread.
+static float roughness_probe(const std::vector<float>& linear, uint32_t w, uint32_t h) {
+    if (linear.size() < size_t(w) * h * 4 || w < 4 || h < 4) return -1.0f;
+    double acc = 0.0;
+    size_t n = 0;
+    for (uint32_t y = 1; y + 1 < h; y += 7) {
+        for (uint32_t x = 1; x + 1 < w; x += 7) {
+            const size_t i = (size_t(y) * w + x) * 4 + 1;
+            acc += std::fabs(2.0 * linear[i] - linear[i - 4] - linear[i + 4]);
+            ++n;
+        }
+    }
+    return n ? float(acc / double(n)) : -1.0f;
+}
+
+std::string ViewMageApp::statusLine() const {
+    if (!export_note_.empty()) return export_note_;
+    if (exporting_)            return "Saving...";
+    if (refine_thread_.joinable() && !refined_ready_.load())
+        return "Denoising...";
+    if (denoiser_)             return "Denoised";
+    return "Developed from RAW";
+}
+
+void ViewMageApp::doExport() {
+    if (exporting_) return;
+    // Belt and braces: the button is already inert while refining, but the
+    // check that MATTERS lives next to the thing it protects, not in draw().
+    if (refine_thread_.joinable() && !refined_ready_.load()) {
+        export_note_ = "Still denoising";
+        dirty_ = true;
+        return;
+    }
+    VCE_LOGI("ViewMage", "export requested (%ux%u, %zu floats, roughness %.5f)",
+             pixels_.w, pixels_.h, pixels_.linear.size(),
+             roughness_probe(pixels_.linear, pixels_.w, pixels_.h));
+
+    // The pixels are needed to write anything. On the DNG path they were kept
+    // for exactly this; anywhere else, say so plainly rather than exporting a
+    // blank file.
+    if (pixels_.linear.empty()) {
+        VCE_LOGE("ViewMage", "export: no pixels held");
+        export_note_ = "Nothing to save";
+        dirty_ = true;
+        return;
+    }
+
+    exporting_ = true;
+    dirty_ = true;
+    draw();          // paint "Saving..." BEFORE the write blocks the thread
+
+    // The source's own filename never reaches us -- the app is handed BYTES
+    // through a ContentResolver, not a path -- so the export is timestamped.
+    const std::string name = export_name_for(std::string());
+    std::string where, err;
+    if (export_png(pixels_.linear, pixels_.w, pixels_.h, ev_, white_,
+                   pixels_.widePrimaries, name, where, err)) {
+        // Name the place it ACTUALLY went: saying "Pictures" when it fell back
+        // elsewhere is how a photo gets lost.
+        export_note_ = "Saved to " + where;
+    } else {
+        export_note_ = "Could not save: " + err;
+        VCE_LOGE("ViewMage", "export failed: %s", err.c_str());
+    }
+    exporting_ = false;
+    dirty_ = true;
+}
+
+void ViewMageApp::pollRefinement() {
+    if (!refined_ready_.load()) return;
+    refined_ready_.store(false);
+    if (refine_thread_.joinable()) refine_thread_.join();
+
+    DecodedImage got;
+    {
+        std::lock_guard<std::mutex> lock(refined_mutex_);
+        got = std::move(refined_);
+    }
+    // A failed refinement is not a failed photo: the ordinary develop is still
+    // on screen and stays there.
+    if (!got.ok()) {
+        VCE_LOGE("ViewMage", "neural denoise failed: %s", got.error.c_str());
+        return;
+    }
+
+    DecodedImage previous = std::move(pixels_);
+    const TextureHandle old = texture_;
+    texture_ = kInvalidTexture;
+    pixels_  = std::move(got);
+
+    if (!uploadTexture()) {
+        // Put the picture that IS on screen back, rather than leaving a blank
+        // one: the refinement is a bonus and must never cost the user the
+        // image they already had.
+        VCE_LOGE("ViewMage", "denoised upload failed; keeping the first render");
+        releaseTexture();
+        pixels_ = std::move(previous);
+        texture_ = old;
+        return;
+    }
+    if (old != kInvalidTexture) renderer_->destroy_texture(old);
+    if (!keep_pixels_) releasePixels();
+    // A new render invalidates whatever was said about the last export.
+    export_note_.clear();
+
+    ev_    = pixels_.autoEv;
+    white_ = pixels_.white;
+    dirty_ = true;
+    VCE_LOGI("ViewMage", "neural denoise: swapped in (autoEV=%.2f white=%.2f, "
+             "roughness %.5f)", ev_, white_,
+             roughness_probe(pixels_.linear, pixels_.w, pixels_.h));
+}
 
 void ViewMageApp::onHostResized() {
     syncViewport();
@@ -131,7 +335,30 @@ void ViewMageApp::loadFromSource() {
     uint32_t maxDim = 0;
     if (renderer_) maxDim = renderer_->caps().max_image_dim_2d;
 
-    pixels_ = decode_jxl(source_.data(), source_.size(), maxDim);
+    // ASK THE RENDERER, do not repeat the request from create(): a PQ request
+    // can fall back to SDR/scRGB, and those are sRGB primaries. Decoding to
+    // BT.2100 for a surface the compositor reads as sRGB is the same error as
+    // the reverse, just pointing the other way.
+    const WorkingPrimaries prim =
+        (renderer_ && renderer_->activeTarget() == OutputTarget::Hdr10PQ)
+            ? WorkingPrimaries::Bt2100 : WorkingPrimaries::Srgb;
+
+    // Route on the file's own signature, not on the extension or the MIME type
+    // the opener claimed: a file manager's guess is not evidence, and both
+    // decoders can say "not mine" cheaply from the first four bytes.
+    //
+    // DNG is not a second format bolted onto a viewer — since the camera became
+    // capture-only it is the ONLY format the camera produces, and developing it
+    // is the whole reason this app exists now. See dng_image.hh.
+    if (looks_like_dng(source_.data(), source_.size())) {
+        pixels_ = decode_dng(source_.data(), source_.size(), maxDim, prim, &noise_);
+        if (noise_.valid)
+            VCE_LOGI("ViewMage", "noise profile: ch0 S=%.3e O=%.3e", noise_.so[0], noise_.so[1]);
+        else
+            VCE_LOGI("ViewMage", "no NoiseProfile tag — a denoiser would have to guess");
+    } else {
+        pixels_ = decode_jxl(source_.data(), source_.size(), maxDim, prim);
+    }
     if (!pixels_.ok()) {
         state_   = State::kError;
         message_ = pixels_.error.empty() ? "Could not decode this image" : pixels_.error;
@@ -174,12 +401,32 @@ void ViewMageApp::loadFromSource() {
         message_ = "Not enough graphics memory";
         return;
     }
-    releasePixels();
+    // Keep them for "Save PNG" when this is a RAW file -- see keep_pixels_.
+    keep_pixels_ = looks_like_dng(source_.data(), source_.size());
+    if (!keep_pixels_) releasePixels();
 
     view_.setImage((int)pixels_.w, (int)pixels_.h);
     syncViewport();
     view_.fit();
     state_ = State::kReady;
+
+    // Read the model's bytes here but do NOT parse them here: the read is I/O
+    // and quick, while building the ONNX session is minutes of CPU on a phone.
+    // Both used to happen on this thread and the app sat frozen for six minutes
+    // with the picture already drawn behind it -- measured, not theorised.
+    if (!denoiser_ && looks_like_dng(source_.data(), source_.size())) {
+        const double t0 = nowSeconds();
+        if (host_->dataReader().read("models/model_bayer.onnx", model_bytes_) &&
+            !model_bytes_.empty()) {
+            VCE_LOGI("ViewMage", "denoise model read: %zu MB in %.0f ms",
+                     model_bytes_.size() / (1024 * 1024),
+                     (nowSeconds() - t0) * 1000.0);
+            startRefinement();
+        } else {
+            VCE_LOGI("ViewMage", "no denoise model shipped; ordinary develop only");
+        }
+    }
+
     VCE_LOGI("ViewMage", "showing %ux%u  transfer=%s primaries=%s  autoEV=%.2f white=%.2f",
              pixels_.w, pixels_.h,
              pixels_.transferName.empty() ? "?" : pixels_.transferName.c_str(),
@@ -397,6 +644,37 @@ void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
 
     if (!wasTap || state_ != State::kReady) return;
 
+    // ── Two coordinate spaces, and they are NOT the same one ────────────────
+    //
+    // Canvas coordinates are SURFACE space: y=0 is the top of the surface, and
+    // the safe insets are a margin inside it (Canvas::top() returns insetTop).
+    // Pointer coordinates arrive in CONTENT space: y=0 is the top of the
+    // content, i.e. already below the status bar.
+    //
+    // So a control drawn at surface y must be hit-tested at y minus the top
+    // inset -- on this phone 125 px, about a fifth of the bar's height. Compare
+    // the two spaces directly and a tap on the visible button lands outside its
+    // rect and does nothing, which is exactly what shipped: the button could not
+    // be pressed at all.
+    //
+    // Worth knowing how that got past a test: an INJECTED tap is in screen
+    // space, so `input tap` at a y well BELOW the button arrives as a value
+    // inside the rect and the export fires. The automated check passed for the
+    // wrong reason while the real control was dead. Verify a control by tapping
+    // where it is DRAWN, and convert the spaces here rather than aiming at the
+    // offset.
+    // Pointer coordinates and Canvas coordinates are the SAME space -- both are
+    // surface-relative. Measured, not assumed: a tap the app received at y=2915
+    // hit a button Canvas had placed at 2878..2951.
+    //
+    // The POST bar takes the tap before the view does, so pressing Save does not
+    // also zoom the picture underneath it.
+    if (export_rect_.contains((float)x, (float)y)) {
+        lastTapTime_ = -1.0;
+        doExport();
+        return;
+    }
+
     const double t = nowSeconds();
     if (lastTapTime_ >= 0.0 && (t - lastTapTime_) <= kDoubleTapGap &&
         distance((float)x, (float)y, lastTapX_, lastTapY_) <= kDoubleTapSlop) {
@@ -451,6 +729,85 @@ void ViewMageApp::draw() {
         const float size = std::max(28.0f, canvas.w() * 0.045f);
         canvas.textCentered(message_, canvas.left() + canvas.w() * 0.5f,
                             canvas.top() + canvas.h() * 0.5f, size, kMessage);
+    }
+
+    // ── The POST bar ────────────────────────────────────────────────────────
+    //
+    // One line of status and one button, and that is the whole UI on purpose:
+    // the render is automatic, so there is nothing to adjust and no editor to
+    // open. What is left is knowing whether the good version has arrived, and
+    // leaving with a file. Anything more would be a photo editor, which this
+    // deliberately is not.
+    if (state_ == State::kReady) {
+        const float size = std::max(22.0f, canvas.w() * 0.028f);
+        const float pad  = size * 0.7f;
+        const float barH = size * 2.4f;
+
+        // ── Keep clear of the system gesture strip ──────────────────────────
+        //
+        // A control flush against the bottom of the surface CANNOT BE PRESSED.
+        // Measured on an S23 Ultra: the surface is 1440x2963 while the screen is
+        // 1440x3088, so the window sits 125 px down and a bar at the surface's
+        // bottom edge lands at screen y 3003..3076 -- inside the gesture-
+        // navigation area, which swallows the touch before the app sees it.
+        // The button was drawn, looked pressable, and was completely dead.
+        //
+        // `safeInsets()` reports 0 on all four edges here, so it cannot be used
+        // for this; the real fix is for app_shell to report the navigation-bar
+        // inset, and until it does this margin is the honest stand-in. It is a
+        // fraction of the surface rather than a pixel count so it survives a
+        // different density.
+        const SafeInsets sys = host_->safeInsets();
+        const float navGuard = std::max((float)sys.bottom, canvas.h() * 0.05f);
+        const float barY = canvas.top() + canvas.h() - barH - navGuard;
+
+        canvas.rect(canvas.left(), barY, canvas.w(), barH, kBar);
+
+        // The button is only real once there is something WORTH writing.
+        //
+        // While a denoise is in flight the picture on screen is the ordinary
+        // develop, and exporting it would hand the user a noisy PNG that looks
+        // like the denoiser did nothing. That is exactly what happened in
+        // testing: Save was pressed during the 26-second window and produced a
+        // file with 7x the shadow noise of the finished render, with no way to
+        // tell from the file that it was the wrong one. So the button is dimmed
+        // and inert until the good pixels exist -- a disabled control is a far
+        // better answer than a plausible-looking bad export.
+        const bool refining = refine_thread_.joinable() && !refined_ready_.load();
+        export_rect_ = {0, 0, 0, 0};
+        if (!exporting_ && !refining) {
+            const std::string label = "Save PNG";
+            const float tw = std::max(canvas.textWidth(label, size), size * 4.0f);
+            const float bw = tw + pad * 2.0f;
+            const float bx = canvas.left() + canvas.w() - bw - pad;
+            const float by = barY + (barH - size * 1.8f) * 0.5f;
+            canvas.rect(bx, by, bw, size * 1.8f, kButton, size * 0.4f);
+            canvas.textCentered(label, bx + bw * 0.5f, by + size * 1.25f,
+                                size, kMessage);
+            export_rect_ = {bx, by, bw, size * 1.8f};
+            // Logged once: the only way to confirm where a control ACTUALLY is
+            // on an HDR surface, whose screencap comes back all zeroes.
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                VCE_LOGI("ViewMage", "Save button at %.0f,%.0f %.0fx%.0f",
+                         bx, by, bw, size * 1.8f);
+            }
+        } else if (refining) {
+            // Same shape, dimmed: the control does not appear from nowhere when
+            // the denoise lands, it just becomes usable.
+            const std::string label = "Save PNG";
+            const float tw = std::max(canvas.textWidth(label, size), size * 4.0f);
+            const float bw = tw + pad * 2.0f;
+            const float bx = canvas.left() + canvas.w() - bw - pad;
+            const float by = barY + (barH - size * 1.8f) * 0.5f;
+            canvas.rect(bx, by, bw, size * 1.8f, kButtonOff, size * 0.4f);
+            canvas.textCentered(label, bx + bw * 0.5f, by + size * 1.25f,
+                                size, kMessageOff);
+        }
+
+        canvas.textCentered(statusLine(), canvas.left() + canvas.w() * 0.32f,
+                            barY + barH * 0.5f + size * 0.35f, size, kMessage);
     }
 
     renderer_->draw(curves_, /*overlay_rotation_deg=*/0,

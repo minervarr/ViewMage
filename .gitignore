@@ -24,3 +24,10 @@ compile_commands.json
 .idea/
 *.iml
 .DS_Store
+
+# The neural denoiser: a 31 MB model and a 17 MB runtime, both fetched by
+# tools/ rather than versioned. Binaries do not belong in git, and both are
+# reproducible from a pinned upstream release.
+app/src/main/assets/models/
+thirdparty/onnxruntime/include/
+thirdparty/onnxruntime/lib/

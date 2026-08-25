@@ -35,12 +35,21 @@ else
     "$OUT/output_target_test"
 fi
 
+# dng_image needs nothing at all -- no libjxl, no GPU, no device. It builds its
+# own DNG fixture in memory, so it runs everywhere and there is no excuse for
+# skipping it. Pass a real .dng as $1 to also develop that.
+echo "== dng_image_test =="
+g++ -std=c++17 -O1 -Wall -o "$OUT/dng_image_test" \
+    dng_image_test.cc ../src/dng_image.cc ../src/decoded_image.cc ../src/ai_denoise.cc \
+    -I ../src -I ../framework/vk_canvas/core
+"$OUT/dng_image_test" ${1:+"$1"}
+
 echo "== jxl_image_test =="
 if ! pkg-config --exists libjxl libjxl_threads libjxl_cms; then
     echo "SKIPPED: no system libjxl (install it, or build thirdparty/libjxl for the host)"
     exit 0
 fi
 g++ -std=c++17 -O1 -Wall -o "$OUT/jxl_image_test" \
-    jxl_image_test.cc ../src/jxl_image.cc \
+    jxl_image_test.cc ../src/jxl_image.cc ../src/decoded_image.cc -I ../src -I ../framework/vk_canvas/core \
     $(pkg-config --cflags --libs libjxl libjxl_threads libjxl_cms)
 "$OUT/jxl_image_test" .

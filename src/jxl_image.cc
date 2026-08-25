@@ -13,11 +13,6 @@
 
 namespace {
 
-void note(JxlImage& im, DiagCode code, DiagLevel level,
-          std::string title, std::string detail) {
-    im.notes.push_back(Diagnostic{code, level, std::move(title), std::move(detail)});
-}
-
 const char* transfer_name(JxlTransferFunction tf) {
     switch (tf) {
         case JXL_TRANSFER_FUNCTION_709:    return "BT.709";
@@ -49,137 +44,10 @@ const char* primaries_name(JxlPrimaries p) {
 // fired on images large enough to hit the GPU's size limit, which are exactly
 // the ones nobody tests with. Hence its own test.
 //
-// Averaging rather than dropping all but one source pixel: the images that
-// reach this path are the huge detailed ones, where point-sampling aliases
-// hardest.
-std::vector<float> box_downsample(const std::vector<float>& src,
-                                  uint32_t sw, uint32_t sh, int factor,
-                                  uint32_t& dw, uint32_t& dh) {
-    dw = std::max(1u, sw / (uint32_t)factor);
-    dh = std::max(1u, sh / (uint32_t)factor);
-    std::vector<float> dst((size_t)dw * dh * 4);
-
-    for (uint32_t y = 0; y < dh; ++y) {
-        const uint32_t y0 = y * (uint32_t)factor;
-        const uint32_t y1 = std::min(y0 + (uint32_t)factor, sh);
-        for (uint32_t x = 0; x < dw; ++x) {
-            const uint32_t x0 = x * (uint32_t)factor;
-            const uint32_t x1 = std::min(x0 + (uint32_t)factor, sw);
-            double acc[4] = {0, 0, 0, 0};
-            uint32_t n = 0;
-            for (uint32_t sy = y0; sy < y1; ++sy) {
-                const float* row = src.data() + ((size_t)sy * sw + x0) * 4;
-                for (uint32_t sx = x0; sx < x1; ++sx, row += 4) {
-                    acc[0] += row[0]; acc[1] += row[1];
-                    acc[2] += row[2]; acc[3] += row[3];
-                    ++n;
-                }
-            }
-            float* out = dst.data() + ((size_t)y * dw + x) * 4;
-            if (n == 0) { out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f; continue; }
-            for (int c = 0; c < 4; ++c) out[c] = (float)(acc[c] / n);
-        }
-    }
-    return dst;
-}
-
-// ── Auto-exposure ───────────────────────────────────────────────────────────
-//
-// Two stages, deliberately combined rather than one chosen over the other.
-//
-// The ANCHOR is principled and does not look at a single pixel: libjxl's linear
-// output normalises 1.0 to the file's declared peak (`intensity_target`, in
-// nits), and BT.2408 puts SDR diffuse white at 203 nits. So a 1000-nit PQ photo
-// wants about -2.3 EV, and that alone removes most of the washout. It is
-// data-independent, so it cannot be fooled by an unusual picture.
-//
-// The HISTOGRAM is the sanity check, because some files declare a nonsense peak
-// and some are simply dark. It is applied at HALF weight and clamped to +/-2 EV
-// from the anchor: an auto-exposure that swings between two frames of the same
-// burst is worse than one that is slightly conservative.
-struct AutoExposure { float ev; float white; };
-
-AutoExposure compute_auto_exposure(const std::vector<float>& px,
-                                   uint32_t w, uint32_t h,
-                                   float intensityTarget, bool isHdr) {
-    // An ordinary image is shown EXACTLY as authored. No anchor, no histogram,
-    // no opinion -- 0 EV and a white point of 1.0, which makes the tone curve a
-    // provable identity and leaves an SDR photo byte-for-byte what it always
-    // was.
-    //
-    // This is not a shortcut, it is the correct behaviour, and getting it wrong
-    // was visible immediately: libjxl reports intensity_target = 255 for SDR
-    // content, so feeding that to the 203-nit rule below darkened every
-    // ordinary photo by a third of a stop. Auto-exposure exists to cope with a
-    // range the display cannot show. When there is no such range, there is
-    // nothing to cope with.
-    if (!isHdr && intensityTarget <= 255.0f) return AutoExposure{0.0f, 1.0f};
-
-    const float anchorGain = (intensityTarget > 0.0f) ? (203.0f / intensityTarget) : 1.0f;
-    const float evAnchor   = std::log2(std::max(anchorGain, 1e-6f));
-
-    // ~200k samples whatever the image size: enough for a stable percentile,
-    // cheap enough to not be noticed next to the decode.
-    const double total = (double)w * h;
-    uint32_t stride = (uint32_t)std::max(1.0, std::sqrt(total / 200000.0));
-
-    constexpr int kBins = 256;          // -16..+16 EV in 1/8-EV steps
-    uint64_t hist[kBins] = {0};
-    uint64_t count = 0;
-
-    for (uint32_t y = 0; y < h; y += stride) {
-        const float* row = px.data() + (size_t)y * w * 4;
-        for (uint32_t x = 0; x < w; x += stride) {
-            const float* p = row + (size_t)x * 4;
-            const float L = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
-            if (!(L > 0.0f)) continue;   // also rejects NaN
-            int bin = (int)((std::log2(L) + 16.0f) * 8.0f);
-            bin = std::clamp(bin, 0, kBins - 1);
-            ++hist[bin];
-            ++count;
-        }
-    }
-
-    AutoExposure out{evAnchor, 1.0f};
-    if (count == 0) {
-        out.ev = std::clamp(evAnchor, -8.0f, 8.0f);
-        return out;
-    }
-
-    auto percentile = [&](double frac) {
-        const uint64_t want = (uint64_t)(frac * (double)count);
-        uint64_t seen = 0;
-        for (int b = 0; b < kBins; ++b) {
-            seen += hist[b];
-            if (seen >= want) return std::exp2((float)b / 8.0f - 16.0f);
-        }
-        return 1.0f;
-    };
-
-    const float l995  = percentile(0.995);
-    const float evPct = -std::log2(std::max(l995, 1e-4f));   // put p99.5 at 1.0
-
-    float ev = evAnchor + std::clamp(evPct - evAnchor, -2.0f, 2.0f) * 0.5f;
-    ev = std::clamp(ev, -8.0f, 8.0f);
-    out.ev = ev;
-
-    // Where the tone curve's knee should call "white": the extreme highlight,
-    // after exposure. An SDR image lands at 1.0, which makes the curve an exact
-    // identity, so an ordinary photo renders exactly as it did before.
-    const float l9999 = percentile(0.9999);
-    out.white = std::clamp(l9999 * std::exp2(ev), 1.0f, 16.0f);
-    return out;
-}
-
 }  // namespace
 
-bool looks_like_jxl(const uint8_t* data, size_t size) {
-    if (!data || size < 12) return false;
-    const JxlSignature sig = JxlSignatureCheck(data, size);
-    return sig == JXL_SIG_CODESTREAM || sig == JXL_SIG_CONTAINER;
-}
-
-JxlImage decode_jxl(const uint8_t* data, size_t size, uint32_t maxDimension) {
+JxlImage decode_jxl(const uint8_t* data, size_t size, uint32_t maxDimension,
+                    WorkingPrimaries primaries) {
     JxlImage out;
 
     if (!data || size == 0) { out.error = "No image to show"; return out; }
@@ -286,17 +154,34 @@ JxlImage decode_jxl(const uint8_t* data, size_t size, uint32_t maxDimension) {
                          "or too dim, that is why.");
                 }
 
-                // Ask for linear light with sRGB primaries. Choosing sRGB
-                // primaries is NOT lossy here, because the buffer is float and
-                // unclipped: colours outside that gamut come back as negative or
-                // greater-than-one components and survive intact. Doing the
-                // gamut matrix in the CMS is both more correct and cheaper than
-                // repeating it per pixel in a shader.
+                // Ask for linear light in the CALLER'S primaries. Whichever
+                // set that is, it is not lossy here, because the buffer is
+                // float and unclipped: colours outside that gamut come back as
+                // negative or greater-than-one components and survive intact.
+                // Doing the gamut matrix in the CMS is both more correct and
+                // cheaper than repeating it per pixel in a shader.
+                //
+                // It MUST agree with the swapchain the shader writes into. The
+                // HDR10 target is BT.2020 by definition and the compositor
+                // reads it that way, so handing it sRGB-primaries numbers
+                // stretches every colour onto BT.2020's much wider gamut --
+                // green-cast overall, because BT.2020's green primary is the
+                // furthest from sRGB's, and with a per-hue error big enough to
+                // make the tone curve's desaturate-toward-white step engage at
+                // a different point per hue, which reads as abrupt colour
+                // transitions rather than as a gamut error. This was latent and
+                // harmless under the extended-linear-scRGB target, which really
+                // is sRGB primaries.
+                //
+                // The transfer function stays LINEAR and the white point D65
+                // either way: the shader works in linear light and
+                // encodeImageLinear() re-applies the PQ OETF at the end.
                 JxlColorEncoding want{};
                 want.color_space       = (info.num_color_channels == 1)
                                        ? JXL_COLOR_SPACE_GRAY : JXL_COLOR_SPACE_RGB;
                 want.white_point       = JXL_WHITE_POINT_D65;
-                want.primaries         = JXL_PRIMARIES_SRGB;
+                want.primaries         = (primaries == WorkingPrimaries::Bt2100)
+                                       ? JXL_PRIMARIES_2100 : JXL_PRIMARIES_SRGB;
                 want.transfer_function = JXL_TRANSFER_FUNCTION_LINEAR;
                 want.rendering_intent  = JXL_RENDERING_INTENT_RELATIVE;
                 want.gamma             = 0.0;
@@ -369,62 +254,8 @@ decoded:
     }
 
     // ── The GPU's ceiling ───────────────────────────────────────────────────
-    if (maxDimension > 0 && (out.w > maxDimension || out.h > maxDimension)) {
-        int factor = 1;
-        while (out.w / (uint32_t)factor > maxDimension ||
-               out.h / (uint32_t)factor > maxDimension) {
-            factor *= 2;
-            if (factor > 1024) { out.error = "This image is too large to open"; return out; }
-        }
-        uint32_t dw = 0, dh = 0;
-        try {
-            out.linear = box_downsample(out.linear, out.w, out.h, factor, dw, dh);
-        } catch (const std::bad_alloc&) {
-            out.error = "This image is too large to open";
-            return out;
-        }
-        out.w = dw;
-        out.h = dh;
-        out.downsampleFactor = factor;
-    }
+    finalize_decoded(out, maxDimension, primaries);
 
-    const AutoExposure ae = compute_auto_exposure(out.linear, out.w, out.h,
-                                                  out.intensityTarget,
-                                                  out.hdrTransfer || out.widePrimaries);
-    out.autoEv = ae.ev;
-    out.white  = ae.white;
-
-    // ── What to tell the user ───────────────────────────────────────────────
-    if (out.hdrTransfer) {
-        note(out, DiagCode::kHdrTransfer, DiagLevel::kInfo,
-             "HDR photo on a standard-range screen",
-             std::string("This photo is stored in ") + out.transferName +
-             ", which holds far brighter highlights than this screen can show at "
-             "once. The bright parts have been compressed to fit. Move the "
-             "exposure slider to look inside them -- the data is all still here.");
-    }
-    if (out.widePrimaries) {
-        note(out, DiagCode::kWidePrimaries, DiagLevel::kNotice,
-             "More colours than the screen has",
-             std::string("The photo uses the ") + out.primariesName +
-             " colour range, which is wider than this screen's. The most vivid "
-             "colours are shown as close as the screen can get.");
-    }
-    if (out.bitsPerSample > 8 || out.exponentBits > 0) {
-        note(out, DiagCode::kHighBitDepth, DiagLevel::kInfo,
-             "More precision than the screen has",
-             "Stored with " + std::to_string(out.bitsPerSample) +
-             " bits per colour; the screen shows 8. Everything is kept at full "
-             "precision in memory, so moving the exposure reveals detail that a "
-             "plain 8-bit viewer would already have thrown away.");
-    }
-    if (out.downsampleFactor > 1) {
-        note(out, DiagCode::kDownsampledForGpu, DiagLevel::kWarning,
-             "Shown smaller than it is",
-             "This photo is larger than this device's graphics hardware can hold, "
-             "so it is displayed at 1/" + std::to_string(out.downsampleFactor) +
-             " size. Detail visible here is not the full detail in the file.");
-    }
     if (frameCount > 1) {
         note(out, DiagCode::kAnimationFirstFrame, DiagLevel::kInfo,
              "Animation, first frame only",
@@ -432,4 +263,10 @@ decoded:
     }
 
     return out;
+}
+
+bool looks_like_jxl(const uint8_t* data, size_t size) {
+    if (!data || size < 12) return false;
+    const JxlSignature sig = JxlSignatureCheck(data, size);
+    return sig == JXL_SIG_CODESTREAM || sig == JXL_SIG_CONTAINER;
 }

@@ -4,13 +4,44 @@ Guidance for Claude Code (claude.ai/code) working in `ViewMage`.
 
 ## What this is
 
-A JPEG XL viewer for Android. A file manager opens it with a `.jxl`; it shows
-the picture; pinch, drag and double-tap move it around. There is no gallery, no
-folder paging, no second format and no settings screen — the name is the scope,
-and additions should be argued against it rather than into it.
+**A RAW post app for Android, and a viewer.** A file manager opens it with a
+`.dng` (or a `.jxl`); it develops or decodes the file and shows the picture;
+pinch, drag and double-tap move it around.
 
 The application is C++. The only Java is a five-line Activity whose entire job
 is `System.loadLibrary`.
+
+### Why the scope changed, and what the new one is
+
+This was "a JPEG XL viewer for Android", and that scope statement did real work:
+it said there is no gallery, no folder paging, no second format and no settings
+screen, and that additions must be argued against the name rather than into it.
+
+What changed is upstream. `camera_without_blood` became **capture-only**: it
+writes DNGs and nothing else (its JXL stills, and `libjxl` with them, were
+removed). So a JXL-only viewer became an app for a format nothing produces,
+while the files that *are* produced — RAW sensor measurements — had nothing to
+open them. The old scope was not wrong; its subject moved.
+
+The replacement scope, and it is meant to bind the same way:
+
+> **Open a camera RAW file and show the scene as it was.** Developing is not an
+> optional extra here — a DNG is measurements, not a picture, and turning it
+> into one is the app's entire job. What earns a place is what serves that
+> single render: develop, denoise, tone map, export. What does not is
+> everything that turns a viewer into an editor.
+
+Concretely, still true and still worth defending:
+
+- **No editor.** The target is one good automatic render, not curves, layers or
+  local adjustments. Sliders are a failure to make the automatic render right.
+- **No gallery.** The app is opened *with* a file.
+- **No second pipeline.** JXL and DNG both produce `DecodedImage` (linear light
+  plus what the file said about itself) and share everything downstream — auto
+  exposure, tone curve, GPU upload, details panel. A third format would be a
+  third *producer*, never a parallel path.
+- **JXL support stays.** It costs nothing now that it is one producer among
+  others, and files already shot still open.
 
 ## Party rules — the directory says which
 
@@ -42,8 +73,22 @@ existing seam rather than faking a SDK layout.
 Desktop tests (no device, no GPU):
 
 ```bash
-./tests/run_desktop_tests.sh
+./tests/run_desktop_tests.sh                # all of them
+./tests/run_desktop_tests.sh /path/to.dng   # also develop a real RAW file
 ```
+
+`dng_image_test` needs **nothing** — no libjxl, no Vulkan, no device — because
+it builds its own DNG in memory. It is the one test with no excuse for being
+skipped, and it pins the parts of a TIFF reader that break silently: tag
+parsing, inline-vs-offset values, the CFA mapping, black/white normalisation,
+truncation handling, and the claim that a neutral scene develops neutral.
+
+Pass a real `.dng` to also develop that and print its distribution. That check
+is how the develop was validated against the camera: the same S23 Ultra frame
+developed here and by the camera's own `raw_develop.cc` agreed to three
+significant figures (median 25.9 vs 25.98 nits, p99 1788.7 vs 1788, peak 2345.9
+vs 2344.6). Two independent implementations landing on the same numbers is the
+only evidence worth having that the port is faithful.
 
 ## Colour management is not optional, and its absence does not look like its absence
 
@@ -137,6 +182,150 @@ BT.2408 203-nit rule darkened every ordinary photo by a third of a stop. An
 image whose range the display can already show is returned at exactly 0 EV and
 a white point of 1.0, which makes the tone curve a provable identity.
 `tests/jxl_image_test.cc` asserts that exactly, not approximately.
+
+## The neural raw denoise (RawNIND UtNet2)
+
+`src/ai_denoise.{hh,cc}` runs the model darktable 5.6 ships as Neural Restore ->
+Raw Denoise. It is a **joint denoise AND demosaic**: in `[1,4,512,512]` packed
+Bayer, out `[1,3,1024,1024]` **camera-native RGB**, ColorMatrix deliberately not
+baked in. So it REPLACES the Malvar block in `dng_image.cc` rather than running
+beside it, and WB -> highlight reconstruction -> CCM -> transfer -> tone curve are
+shared by both paths. Model GPL-3.0, app AGPL-3.0 — compatible; the attribution
+in `README.md` and the details panel is a **licence obligation**.
+
+Ported from `darktable-ai`'s `models/rawdenoise-nind/demo.py` and verified
+**bit-exact** against it (max abs diff `0.000e+00` over 7.5M values). Three
+details are load-bearing, and each one fails looking like a *colour* bug:
+
+- **Plane order `[R, G1, G2, B]`**, G1 being the first green in raster order.
+- **Mirror-padded tiles, overlap TRIMMED not blended** — `T=512, overlap=64,
+  step=384`, geometry baked into the ONNX export, not tunable.
+- **One global gain match after stitching** (`mean(in)/mean(out)`). The net emits
+  an arbitrary learned scale (`match_gain=output` at training). Skip it and every
+  photo is the wrong brightness. Per tile instead of globally gives each tile its
+  own exposure.
+
+**Never feed it white-balanced data.** It was trained unbalanced; `g[]` stays
+strictly downstream. This is the single easiest thing to "tidy" into a silent
+quality regression.
+
+Highlight reconstruction is **approximate on the AI path**: the pack clips input
+to [0,1], so a blown channel arrives at the ceiling rather than above it. The two
+paths are not identical there.
+
+**Measured, S23 Ultra, 4080x3060:** model read 167 ms, session build <100 ms,
+denoise **22.3 s**, shadow noise down **12x** (roughness 0.00411 -> 0.00035) with
+text still sharp. Desktop x86 is ~211 ms/tile, 24 tiles.
+
+Because 22 s is far too long to hold a blank screen, `viewmage_app.cc` does
+**progressive refinement**: the ordinary develop is uploaded immediately, the
+denoise runs on a worker, and `pollRefinement()` swaps the texture on the main
+thread when it lands. A failed refinement keeps the picture that is already up.
+
+**Gotcha that cost a measurement:** the model load was first done on the main
+thread and appeared to take **six minutes**. It does not — the app had been
+backgrounded with the screen off and Android had frozen the process. Wake the
+device (`input keyevent KEYCODE_WAKEUP`, `svc power stayon true`) before timing
+anything, or you will measure the scheduler instead of your code. The load is
+still on the worker, where it belongs.
+
+Neither the 31 MB model nor the 17 MB ORT `.so` is in git; `tools/fetch_model.sh`
+(pinned tag + SHA-256) and `tools/fetch_onnxruntime.sh` fetch them, and CMake
+warns and builds without the denoise when they are absent (`VIEWMAGE_WITH_ORT`).
+
+## The POST bar and PNG export
+
+`src/png_export.{hh,cc}` plus the bottom bar in `viewmage_app.cc`'s `draw()`.
+One status line and one button, because the render is automatic — there is
+nothing to adjust, and anything more would be a photo editor, which this is
+deliberately not.
+
+The export writes **8-bit sRGB**, which is a real loss of range and still the
+right choice: 16-bit PQ renders as a washed, too-dark picture in anything that
+is not colour-managed (the complaint that started all this), and JXL cannot be
+decoded by the phone that shot the photo. The DNG remains the archive; the PNG
+is the copy you send. What is written is **what was on screen** — same exposure,
+same tone curve, same rolloff — so `rolloff()` here MIRRORS `image_frag.slang`
+and vk_canvas's `rolloffCurve()`. Change one, change all three.
+
+Two orderings are copied from the shader and matter for the same reasons:
+negatives are clamped **before** the luminance dot product (otherwise
+out-of-gamut speculars go magenta), and BT.2020 luma weights are used on wide
+pixels (709's weights skew the ratio per hue and reappear as a green cast).
+
+**Save is inert until the denoise lands.** The refinement takes ~26 s, and
+during it the pixels on screen are the ordinary demosaic. Exporting then hands
+the user a PNG with ~7x the shadow noise of the finished render and nothing in
+the file to say it was the wrong one — which is exactly what happened in
+testing. The button is dimmed while `refine_thread_` is in flight and
+`doExport()` refuses independently, because the check that matters belongs next
+to the thing it protects, not in `draw()`.
+
+**`roughness_probe()` is the tool that caught it.** Mean `|2c - l - r|` on green,
+sampled: Malvar reads ~0.023 on this scene and the neural output ~0.012 in
+linear (0.050 vs 0.005 after tone mapping) — an order of magnitude apart in the
+shadows. Both buffers are byte-identical in SIZE, so this is the only cheap way
+to tell from a log which one is in memory. `export requested (... roughness ...)`
+answers "did Save write the denoised pixels?" directly.
+
+**Pixels are KEPT after upload on the DNG path** (`keep_pixels_`), against
+`releasePixels()`'s usual rule. They are the app's largest allocation, and they
+are also the only thing Save can write without spending another 26 s
+re-denoising — for an app whose purpose is leaving with a file, that trade goes
+the other way round than it does for a viewer.
+
+**Scoped storage:** at `targetSdk 34` a plain filesystem write into
+`/sdcard/Pictures` fails. `export_dir()` tries it, **probes it for writability**
+(creating a directory is not proof of being allowed to write in it), and falls
+back to the app's own external files dir. The UI then says "Saved to the app
+folder" rather than claiming "Pictures" — naming the wrong place is how a user
+loses a file. The proper fix is a MediaStore insert through a ContentResolver,
+which is Java and belongs in `app_shell`, not here.
+
+**Two touch bugs lived here, and an injected tap hid both.** Worth reading
+before adding any control:
+
+- **The surface is not the screen.** Measured on an S23 Ultra: surface
+  **1440x2963**, screen **1440x3088**, so the window sits **125 px down**. A bar
+  placed flush at the surface's bottom edge lands at screen y 3003..3076 —
+  inside the **gesture-navigation strip**, which swallows the touch before the
+  app sees it. The button drew, looked pressable, and was completely dead. The
+  POST bar therefore keeps a `navGuard` margin above the bottom.
+- **`safeInsets()` reports 0 on all four edges**, so it cannot be used to solve
+  that. The proper fix is app_shell reporting the navigation inset; the margin
+  is the stand-in until then.
+- **Pointer and Canvas coordinates ARE the same space** (both surface-relative).
+  Verified: a tap the app received at y=2915 hit a rect Canvas placed at
+  2878..2951. Do not "correct" pointer coordinates by the insets.
+
+**Why the automated test passed anyway:** `adb input tap` is in SCREEN space and
+injects below the gesture layer, so a tap aimed 125 px BELOW the button arrives
+as a value inside its rect and fires the export — while a real finger on the
+button did nothing. `draw()` logs the rect once (`Save button at x,y wxh`)
+because `adb screencap` returns an all-zero PNG on HDR content, so the control
+cannot be seen. **Add 125 to the logged y to get where to inject, and never
+treat a passing injected tap as proof a control is reachable.**
+
+## The display tone curve
+
+`apply_display_render()` in `decoded_image.cc`, called from the DNG path only —
+a JXL arrives already rendered and curving it twice doubles the contrast. It is a
+**toe, not an S-curve**: slope `kContrast` at mid grey, smoothstepped back to
+exactly 1.0 by diffuse white, so **highlights are numerically untouched** (p99 and
+peak are identical pre/post on real frames). The pivot is where auto-exposure
+actually puts mid grey, so it is a contrast change and not an exposure shift.
+
+Two bugs live in the first version of this, both caught by measuring:
+
+- A straight log-log line (slope 1.25 everywhere) amplified a night frame's p99
+  from 1526 to **3878 nits**. Highlights then get compressed a second time by the
+  shader's rolloff, which is the pass that knows the display headroom, and
+  stacking the two flattens speculars.
+- A fixed *scene-referred* pivot put a dark scene almost entirely on the
+  darkening side, reading as an underexposure.
+
+The shared shader (`framework/.../image_frag.slang`) deliberately refuses S-curves
+— it is an instrument. The rendering intent belongs here, in the POST app.
 
 ## Four things the build taught, all non-obvious
 

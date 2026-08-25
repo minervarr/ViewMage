@@ -56,8 +56,9 @@ struct Diagnostic {
 };
 
 struct JxlImage {
-    // w*h*4 floats. LINEAR light, sRGB/BT.709 primaries, D65, straight alpha,
-    // top row first. NOT clamped to [0,1] and must not be.
+    // w*h*4 floats. LINEAR light, D65, straight alpha, top row first, in the
+    // primaries the caller asked decode_jxl() for (sRGB/BT.709 by default,
+    // BT.2100 for the HDR10 PQ target). NOT clamped to [0,1] and must not be.
     std::vector<float> linear;
     uint32_t w = 0, h = 0;
 
@@ -100,11 +101,35 @@ struct JxlImage {
     bool ok() const { return error.empty() && w > 0 && h > 0; }
 };
 
+// The struct above is not JXL-specific and has not been for a while: it is
+// "linear light plus what the file said about itself". A DNG develop produces
+// exactly the same thing (see dng_image.hh), and everything downstream — auto
+// exposure, tone curve, GPU upload, details panel — is written against this
+// shape rather than against a format. The old name is kept so the existing
+// call sites and tests still read naturally; new code should say DecodedImage.
+using DecodedImage = JxlImage;
+
 // True when `data` starts with a JPEG XL signature -- bare codestream or the
 // ISOBMFF container form. Cheap, and it exists so that opening a PNG by
 // mistake says "Not a JPEG XL image" instead of surfacing a decoder error that
 // means nothing to anyone.
 bool looks_like_jxl(const uint8_t* data, size_t size);
+
+// Which primaries the decoded floats should be expressed in.
+//
+// This is NOT a preference, it is a contract with the swapchain. The shader
+// hands its linear numbers to a surface whose colourspace the compositor
+// already believes it knows: an HDR10/ST2084 surface is BT.2020 by definition,
+// an sRGB or extended-linear-scRGB one is sRGB/BT.709. Decoding to the wrong
+// set stretches every colour onto the other set's gamut -- most visibly toward
+// green, because BT.2020's green primary is the one furthest from sRGB's.
+//
+// So the caller must pass whatever target the Renderer ACTUALLY resolved to
+// (it can silently fall back to SDR), never the one it asked for.
+enum class WorkingPrimaries {
+    Srgb,     // sRGB / BT.709 -- the SDR and extended-linear-scRGB targets
+    Bt2100,   // BT.2020 / BT.2100 -- the HDR10 PQ target
+};
 
 // Decode to linear float RGBA.
 //
@@ -117,4 +142,34 @@ bool looks_like_jxl(const uint8_t* data, size_t size);
 // Never throws. Every failure -- truncated input, wrong format, a libjxl
 // error, an allocation that did not happen -- comes back as a populated
 // `error`.
-JxlImage decode_jxl(const uint8_t* data, size_t size, uint32_t maxDimension);
+// `primaries` is the gamut the returned floats are expressed in; see
+// WorkingPrimaries. It defaults to sRGB, which is what every pre-HDR10 caller
+// wanted and keeps the decode self-consistent when nothing is passed.
+JxlImage decode_jxl(const uint8_t* data, size_t size, uint32_t maxDimension,
+                    WorkingPrimaries primaries = WorkingPrimaries::Srgb);
+
+// The half of a decode that is NOT format-specific: downsample to the GPU's
+// ceiling, compute the auto exposure, and add the notes that say how the file
+// exceeds what the screen can show.
+//
+// Every producer of a DecodedImage must end by calling this. It is shared
+// rather than duplicated because it reasons about linear light and about what
+// the file claimed of itself — neither of which has anything to do with the
+// container the pixels arrived in. `decode_jxl` calls it; so does `decode_dng`.
+// A second copy would drift, and the drift would show up as "the same photo
+// looks different depending on which format I saved it as".
+//
+// Expects `linear`, `w`, `h`, `intensityTarget`, `hdrTransfer`, `widePrimaries`
+// and `bitsPerSample` to already be filled in. Does nothing to a failed decode.
+// The display render: turns scene-referred linear light into a picture. Called
+// ONLY from the RAW develop path -- a JXL arrives already rendered by whatever
+// wrote it, and curving it a second time would double the contrast. See the
+// long rationale in decoded_image.cc.
+void apply_display_render(DecodedImage& im, WorkingPrimaries primaries);
+
+void finalize_decoded(DecodedImage& out, uint32_t maxDimension, WorkingPrimaries primaries);
+
+// Append one user-facing note. Shared by both decoders: the notes are about how
+// the file exceeds the screen, which is not a per-format question.
+void note(DecodedImage& im, DiagCode code, DiagLevel level,
+          std::string title, std::string detail);

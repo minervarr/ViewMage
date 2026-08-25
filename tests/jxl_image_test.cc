@@ -112,10 +112,12 @@ static void test_hdr_pq_is_detected_and_pulled_down() {
     assert(std::fabs(im.intensityTarget - 1000.0f) < 1.0f);
     assert(im.colorManaged);                   // the CMS actually ran
 
-    // 203 nits of diffuse white against a declared 1000-nit peak is about
-    // -2.3 EV. Without colour management this image came out ~5 stops wrong,
-    // which is precisely the washout being fixed.
-    assert(im.autoEv < -1.0f && im.autoEv > -5.0f);
+    // A declared 1000-nit peak against 203 nits of diffuse white is a GAIN of
+    // 1000/203, about +2.3 EV: libjxl hands back 1.0 == 1000 nits and the
+    // extended-linear surface wants 1.0 == 203. The assertion used to demand
+    // the reciprocal (-2.3 EV), which is what let the inverted anchor ship.
+    // The histogram term moves this by at most +/-1 EV.
+    assert(im.autoEv > 1.0f && im.autoEv < 5.0f);
 
     assert(has_note(im, DiagCode::kHdrTransfer));
     assert(has_note(im, DiagCode::kWidePrimaries));
