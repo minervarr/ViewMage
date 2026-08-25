@@ -175,7 +175,11 @@ void ViewMageApp::startRefinement() {
         // of seconds, and a second full decode is far easier to reason about
         // than a pipeline that can be resumed from the middle.
         DecodedImage out = decode_dng(source_.data(), source_.size(), maxDim,
-                                      prim, nullptr, denoiser_.get());
+                                      prim, nullptr, denoiser_.get(),
+                                      [this](float f) {
+                                          refine_progress_.store(f);
+                                          return !refine_abort_.load();
+                                      });
         if (refine_abort_.load()) return;
         VCE_LOGI("ViewMage", "neural denoise: %.1f s for %ux%u",
                  nowSeconds() - t1, out.w, out.h);
@@ -210,9 +214,11 @@ static float roughness_probe(const std::vector<float>& linear, uint32_t w, uint3
 std::string ViewMageApp::statusLine() const {
     if (!export_note_.empty()) return export_note_;
     if (exporting_)            return "Saving...";
-    if (refine_thread_.joinable() && !refined_ready_.load())
-        return "Denoising...";
-    if (denoiser_)             return "Denoised";
+    if (refine_thread_.joinable() && !refined_ready_.load()) {
+        const int pct = (int)(refine_progress_.load() * 100.0f + 0.5f);
+        return "Denoising " + std::to_string(pct) + "%";
+    }
+    if (denoised_)             return "Denoised";
     return "Developed from RAW";
 }
 
@@ -297,8 +303,9 @@ void ViewMageApp::pollRefinement() {
     // A new render invalidates whatever was said about the last export.
     export_note_.clear();
 
-    ev_    = pixels_.autoEv;
-    white_ = pixels_.white;
+    ev_       = pixels_.autoEv;
+    white_    = pixels_.white;
+    denoised_ = true;
     dirty_ = true;
     VCE_LOGI("ViewMage", "neural denoise: swapped in (autoEV=%.2f white=%.2f, "
              "roughness %.5f)", ev_, white_,
@@ -421,7 +428,9 @@ void ViewMageApp::loadFromSource() {
             VCE_LOGI("ViewMage", "denoise model read: %zu MB in %.0f ms",
                      model_bytes_.size() / (1024 * 1024),
                      (nowSeconds() - t0) * 1000.0);
-            startRefinement();
+            // NOT started here. Denoising is minutes of CPU and a deliberate
+            // step taken before exporting -- not something to spend on every
+            // photo merely opened. The Denoise button starts it.
         } else {
             VCE_LOGI("ViewMage", "no denoise model shipped; ordinary develop only");
         }
@@ -669,6 +678,14 @@ void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
     //
     // The POST bar takes the tap before the view does, so pressing Save does not
     // also zoom the picture underneath it.
+    if (denoise_rect_.contains((float)x, (float)y)) {
+        lastTapTime_ = -1.0;
+        export_note_.clear();
+        startRefinement();
+        dirty_ = true;
+        return;
+    }
+
     if (export_rect_.contains((float)x, (float)y)) {
         lastTapTime_ = -1.0;
         doExport();
@@ -763,47 +780,51 @@ void ViewMageApp::draw() {
 
         canvas.rect(canvas.left(), barY, canvas.w(), barH, kBar);
 
-        // The button is only real once there is something WORTH writing.
-        //
-        // While a denoise is in flight the picture on screen is the ordinary
-        // develop, and exporting it would hand the user a noisy PNG that looks
-        // like the denoiser did nothing. That is exactly what happened in
-        // testing: Save was pressed during the 26-second window and produced a
-        // file with 7x the shadow noise of the finished render, with no way to
-        // tell from the file that it was the wrong one. So the button is dimmed
-        // and inert until the good pixels exist -- a disabled control is a far
-        // better answer than a plausible-looking bad export.
+        // Laid out from the right edge: Save, then Denoise beside it.
+        auto button = [&](const std::string& label, float rightOf, bool live,
+                          Rect& hit) {
+            const float tw = std::max(canvas.textWidth(label, size), size * 4.0f);
+            const float bw = tw + pad * 2.0f;
+            const float bx = rightOf - bw - pad;
+            const float by = barY + (barH - size * 1.8f) * 0.5f;
+            canvas.rect(bx, by, bw, size * 1.8f, live ? kButton : kButtonOff,
+                        size * 0.4f);
+            canvas.textCentered(label, bx + bw * 0.5f, by + size * 1.25f, size,
+                                live ? kMessage : kMessageOff);
+            hit = live ? Rect{bx, by, bw, size * 1.8f} : Rect{0, 0, 0, 0};
+            return bx;
+        };
+
         const bool refining = refine_thread_.joinable() && !refined_ready_.load();
-        export_rect_ = {0, 0, 0, 0};
-        if (!exporting_ && !refining) {
-            const std::string label = "Save PNG";
-            const float tw = std::max(canvas.textWidth(label, size), size * 4.0f);
-            const float bw = tw + pad * 2.0f;
-            const float bx = canvas.left() + canvas.w() - bw - pad;
-            const float by = barY + (barH - size * 1.8f) * 0.5f;
-            canvas.rect(bx, by, bw, size * 1.8f, kButton, size * 0.4f);
-            canvas.textCentered(label, bx + bw * 0.5f, by + size * 1.25f,
-                                size, kMessage);
-            export_rect_ = {bx, by, bw, size * 1.8f};
-            // Logged once: the only way to confirm where a control ACTUALLY is
-            // on an HDR surface, whose screencap comes back all zeroes.
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                VCE_LOGI("ViewMage", "Save button at %.0f,%.0f %.0fx%.0f",
-                         bx, by, bw, size * 1.8f);
-            }
-        } else if (refining) {
-            // Same shape, dimmed: the control does not appear from nowhere when
-            // the denoise lands, it just becomes usable.
-            const std::string label = "Save PNG";
-            const float tw = std::max(canvas.textWidth(label, size), size * 4.0f);
-            const float bw = tw + pad * 2.0f;
-            const float bx = canvas.left() + canvas.w() - bw - pad;
-            const float by = barY + (barH - size * 1.8f) * 0.5f;
-            canvas.rect(bx, by, bw, size * 1.8f, kButtonOff, size * 0.4f);
-            canvas.textCentered(label, bx + bw * 0.5f, by + size * 1.25f,
-                                size, kMessageOff);
+        const float right = canvas.left() + canvas.w();
+
+        // Save stays available on the plain develop -- someone who does not want
+        // to wait should still be able to leave with their photo. It goes inert
+        // only while a denoise is IN FLIGHT, because exporting then writes the
+        // un-denoised pixels and looks like the denoiser did nothing: that is
+        // exactly what happened in testing, a file with 7x the shadow noise and
+        // nothing in it to say it was the wrong one.
+        const float saveX = button("Save PNG", right, !exporting_ && !refining,
+                                   export_rect_);
+
+        // Denoise is offered until it has been done; afterwards the status reads
+        // "Denoised" and there is nothing left to press.
+        if (!model_bytes_.empty() && !denoised_) {
+            button("Denoise", saveX, !refining && !exporting_, denoise_rect_);
+        } else {
+            denoise_rect_ = {0, 0, 0, 0};
+        }
+
+        // Logged once: the only way to confirm where a control ACTUALLY is on an
+        // HDR surface, whose screencap comes back all zeroes.
+        static bool logged = false;
+        if (!logged && export_rect_.w > 0.0f) {
+            logged = true;
+            VCE_LOGI("ViewMage", "Save at %.0f,%.0f %.0fx%.0f; Denoise at "
+                     "%.0f,%.0f %.0fx%.0f",
+                     export_rect_.x, export_rect_.y, export_rect_.w,
+                     export_rect_.h, denoise_rect_.x, denoise_rect_.y,
+                     denoise_rect_.w, denoise_rect_.h);
         }
 
         canvas.textCentered(statusLine(), canvas.left() + canvas.w() * 0.32f,

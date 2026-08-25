@@ -193,9 +193,24 @@ beside it, and WB -> highlight reconstruction -> CCM -> transfer -> tone curve a
 shared by both paths. Model GPL-3.0, app AGPL-3.0 — compatible; the attribution
 in `README.md` and the details panel is a **licence obligation**.
 
+**FORCE_RGGB, and the trap that hid it.** The model is trained on RGGB and its
+PixelShuffle head reconstructs at FIXED sub-pixel positions, so it cares about
+the 2x2 cell's spatial PHASE, not only about which plane holds which colour.
+This sensor is **GBRG** (`raw_pattern [[3,2],[0,1]]`, `color_desc RGBG`), so
+packing by colour alone put R and B one sensor row from where the model expects
+them: magenta/cyan fringing on every high-contrast edge, mottling in flat areas,
+and mush where text should be. `pack_bayer_rggb()` now crops by at most one row
+and column onto RGGB and reports the offset, with Malvar filling the border.
+
+The bit-exact parity test did NOT catch this, and the reason matters: it fed
+both implementations the **same packed array**, so it validated tiling, edge
+mirroring and gain-match — and never the packing. A parity test that starts
+downstream of a step cannot vouch for that step.
+
 Ported from `darktable-ai`'s `models/rawdenoise-nind/demo.py` and verified
-**bit-exact** against it (max abs diff `0.000e+00` over 7.5M values). Three
-details are load-bearing, and each one fails looking like a *colour* bug:
+bit-exact against it from the packed array onward (max abs diff `0.000e+00` over
+7.5M values). Three details are load-bearing, and each one fails looking like a
+*colour* bug:
 
 - **Plane order `[R, G1, G2, B]`**, G1 being the first green in raster order.
 - **Mirror-padded tiles, overlap TRIMMED not blended** — `T=512, overlap=64,
@@ -213,8 +228,39 @@ Highlight reconstruction is **approximate on the AI path**: the pack clips input
 to [0,1], so a blown channel arrives at the ceiling rather than above it. The two
 paths are not identical there.
 
+**The self-ensemble is x4, and x8 is WRONG here.** `run(..., ensemble=true)`
+averages the frame through the four symmetries that keep a Bayer cell's phase
+recoverable: identity, transpose, 180 and anti-transpose — with the R/B OUTPUT
+channels exchanged for the two that land R's corner on B's. A 90-degree rotation
+turns RGGB into GBRG and no plane permutation undoes it, so feeding one hands the
+model a phase it never saw.
+
+Measured on a real night frame (roughness / detail on green):
+
+| | roughness | detail |
+|---|---|---|
+| single pass | 0.01430 | 0.01610 |
+| **valid x4** | **0.01031** | 0.01370 |
+| naive x8 (rotating the packed tensor) | 0.00841 | 0.01301 |
+
+**The naive x8 scores BEST on a detail/noise ratio and is still wrong**:
+averaging mis-registered predictions is blur, and a crude ratio cannot tell blur
+from denoising. Do not "improve" this by adding rotations.
+
+**Anscombe VST was tried and rejected**, despite being an obvious idea given the
+`NoiseProfile` tag: noise -22%, detail -17%, i.e. proportional, no gain. A VST is
+the right tool for a FIXED-level Gaussian denoiser; RawNIND is blind and trained
+on real raw noise, so stabilising the variance moves the signal away from what it
+learned. The tag is still correct metadata — it just does not feed this model.
+
+**Denoising is a BUTTON, not automatic.** It is ~107 s for a 12 MP frame with the
+x4 ensemble; spending that on every photo merely opened is wrong. `draw()` offers
+Denoise until it has run, Save stays live on the plain develop so nobody is
+forced to wait, and Save goes inert only while a denoise is in flight.
+
 **Measured, S23 Ultra, 4080x3060:** model read 167 ms, session build <100 ms,
-denoise **22.3 s**, shadow noise down **12x** (roughness 0.00411 -> 0.00035) with
+denoise **26 s** single-pass / **107 s** with the x4 ensemble, shadow noise down
+**20x** (0.00411 -> 0.00020) (roughness 0.00411 -> 0.00035) with
 text still sharp. Desktop x86 is ~211 ms/tile, 24 tiles.
 
 Because 22 s is far too long to hold a blank screen, `viewmage_app.cc` does

@@ -81,6 +81,8 @@ private:
     struct Rect { float x, y, w, h; bool contains(float px, float py) const {
         return w > 0.0f && px >= x && px <= x + w && py >= y && py <= y + h; } };
     Rect        export_rect_{0, 0, 0, 0};   // set by draw(), read by the touch
+    Rect        denoise_rect_{0, 0, 0, 0};
+    bool        denoised_ = false;          // a refinement has landed
     bool        exporting_ = false;
     std::string export_note_;               // shown once a file has been written
 

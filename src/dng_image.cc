@@ -283,7 +283,8 @@ bool looks_like_dng(const uint8_t* data, size_t size) {
 
 DecodedImage decode_dng(const uint8_t* data, size_t size, uint32_t maxDimension,
                         WorkingPrimaries primaries, NoiseModel* out_noise,
-                        RawDenoiser* denoiser) {
+                        RawDenoiser* denoiser,
+                        std::function<bool(float)> progress) {
     DecodedImage img;
     auto fail = [&img](const char* why) { img.error = why; return img; };
 
@@ -438,13 +439,21 @@ DecodedImage decode_dng(const uint8_t* data, size_t size, uint32_t maxDimension,
     // unbalanced data, and "tidying" the gains up in front of it would be a
     // silent quality regression rather than a visible bug.
     std::vector<float> ai_rgb;
+    // Where the denoised plane sits inside the full image, and how big it is:
+    // forcing the mosaic onto RGGB can cost one row and one column, so the AI
+    // result covers [ai_ox, ai_ox+ai_w) x [ai_oy, ai_oy+ai_h) and Malvar fills
+    // the remaining border. A one-pixel edge is not worth a special case in the
+    // model; silently mis-indexing it would shift the whole picture.
+    int ai_ox = 0, ai_oy = 0, ai_w = 0, ai_h = 0;
     if (denoiser) {
         std::vector<float> packed;
         int pw = 0, ph = 0;
         pack_bayer_rggb(bayer, W, H, stride_px, m.cfa, eff_black, m.white,
-                        packed, pw, ph);
+                        packed, pw, ph, ai_ox, ai_oy);
         std::string derr;
-        if (denoiser->run(packed.data(), pw, ph, ai_rgb, derr)) {
+        if (denoiser->run(packed.data(), pw, ph, ai_rgb, derr, progress)) {
+            ai_w = pw * 2;
+            ai_h = ph * 2;
             note(img, DiagCode::kHighBitDepth, DiagLevel::kInfo,
                  "Denoised by RawNIND UtNet2",
                  "The sensor noise was removed on the raw mosaic, before "
@@ -460,15 +469,16 @@ DecodedImage decode_dng(const uint8_t* data, size_t size, uint32_t maxDimension,
                  "apart from the noise being left in.");
         }
     }
-    // Odd sensor dimensions cannot be packed into 2x2 cells; the packer halves
-    // them, so a mismatch here means the mosaic was not what we assumed.
-    const float* ai = (ai_rgb.size() == size_t(W) * H * 3) ? ai_rgb.data() : nullptr;
+    const float* ai = (!ai_rgb.empty() &&
+                       ai_rgb.size() == size_t(ai_w) * ai_h * 3) ? ai_rgb.data()
+                                                                 : nullptr;
 
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             float rgb[3];
-            if (ai) {
-                const float* s = &ai[(size_t(y) * W + x) * 3];
+            const int ax = x - ai_ox, ay = y - ai_oy;
+            if (ai && ax >= 0 && ay >= 0 && ax < ai_w && ay < ai_h) {
+                const float* s = &ai[(size_t(ay) * ai_w + ax) * 3];
                 rgb[0] = s[0]; rgb[1] = s[1]; rgb[2] = s[2];
             } else {
             const float c  = at(x, y);

@@ -31,7 +31,8 @@
 // green is which, but it does care that they stay in that order.
 void pack_bayer_rggb(const uint16_t* mosaic, int w, int h, int stride_px,
                      int cfa, const double black[4], double white,
-                     std::vector<float>& packed, int& pw, int& ph) {
+                     std::vector<float>& packed, int& pw, int& ph,
+                     int& ox, int& oy) {
     // 2x2 colour codes in raster order: 0=R, 1=G, 2=B. Same table as the
     // camera's dng_writer.cc cfa_pattern(), kept in the same order on purpose.
     static const int kPat[4][4] = {
@@ -40,7 +41,30 @@ void pack_bayer_rggb(const uint16_t* mosaic, int w, int h, int stride_px,
         {1, 2, 0, 1},   // GBRG
         {2, 1, 1, 0},   // BGGR
     };
-    const int* pat = kPat[(cfa >= 0 && cfa < 4) ? cfa : 0];
+    const int* pat0 = kPat[(cfa >= 0 && cfa < 4) ? cfa : 0];
+
+    // Shift onto RGGB -- see the header. RGGB needs (0,0), GRBG (1,0),
+    // GBRG (0,1), BGGR (1,1); solved rather than tabulated so a wrong CFA code
+    // cannot silently pick a wrong offset.
+    ox = oy = 0;
+    for (int dy = 0; dy < 2 && !(ox || oy); ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            const int c00 = pat0[((0 + dy) & 1) * 2 + ((0 + dx) & 1)];
+            const int c01 = pat0[((0 + dy) & 1) * 2 + ((1 + dx) & 1)];
+            const int c10 = pat0[((1 + dy) & 1) * 2 + ((0 + dx) & 1)];
+            const int c11 = pat0[((1 + dy) & 1) * 2 + ((1 + dx) & 1)];
+            if (c00 == 0 && c01 == 1 && c10 == 1 && c11 == 2) { ox = dx; oy = dy; }
+            if (ox || oy) break;
+        }
+    }
+
+    // After the shift the pattern IS RGGB, by construction.
+    static const int kRggb[4] = {0, 1, 1, 2};
+    const int* pat = kRggb;
+
+    mosaic += size_t(oy) * stride_px + ox;
+    w -= ox;
+    h -= oy;
 
     pw = w / 2;
     ph = h / 2;
@@ -65,7 +89,7 @@ void pack_bayer_rggb(const uint16_t* mosaic, int w, int h, int stride_px,
         // sensor whose channels sit at different blacks would otherwise get a
         // per-channel gain error, i.e. a tint, which is exactly the class of bug
         // this whole file is easy to introduce.
-        const double bl = black[i];
+        const double bl = black[(((i / 2) + oy) & 1) * 2 + (((i % 2) + ox) & 1)];
         const double span = std::max(white - bl, 1.0);
         float* out = packed.data() + size_t(dst[i]) * plane;
         for (int y = 0; y < ph; ++y) {
@@ -98,7 +122,8 @@ std::unique_ptr<RawDenoiser> RawDenoiser::load(const uint8_t*, size_t,
 }
 
 bool RawDenoiser::run(const float*, int, int, std::vector<float>&,
-                      std::string& err, const std::function<bool(float)>&) {
+                      std::string& err, const std::function<bool(float)>&,
+                      bool) {
     err = "this build has no neural denoiser";
     return false;
 }
@@ -149,10 +174,88 @@ std::unique_ptr<RawDenoiser> RawDenoiser::load(const uint8_t* onnx, size_t bytes
     return d;
 }
 
+// One symmetry of the square that keeps a Bayer cell's phase recoverable.
+//
+// Each is applied to EVERY PLANE with the plane order untouched -- which is the
+// same tensor as packing the transformed mosaic and permuting the planes back,
+// worked through on paper and confirmed numerically. `swap_rb` is the half that
+// is easy to forget: 180 and anti-transpose land R's corner of the cell on B's,
+// so the model is told a blue plane is red and its output channels have to be
+// exchanged back. Omitting that is what made a naive ensemble wrong.
+namespace {
+struct Symmetry { bool transpose; bool rot180; bool swap_rb; };
+constexpr Symmetry kSyms[4] = {
+    {false, false, false},   // identity
+    {true,  false, false},   // transpose      (the two greens exchange; R,B stay)
+    {false, true,  true },   // 180
+    {true,  true,  true },   // anti-transpose
+};
+
+// Map a destination pixel back to its source under `sym`.
+inline void map_src(const Symmetry& s, int x, int y, int w, int h,
+                    int& sx, int& sy) {
+    if (s.transpose) { int t = x; x = y; y = t; int tw = w; w = h; h = tw; }
+    if (s.rot180)    { x = w - 1 - x; y = h - 1 - y; }
+    sx = x; sy = y;
+}
+}  // namespace
+
 bool RawDenoiser::run(const float* packed, int pw, int ph,
                       std::vector<float>& out, std::string& err,
-                      const std::function<bool(float)>& progress) {
+                      const std::function<bool(float)>& progress,
+                      bool ensemble) {
     if (!packed || pw <= 0 || ph <= 0) { err = "nothing to denoise"; return false; }
+
+    const int passes = ensemble ? 4 : 1;
+    if (passes > 1) {
+        // Accumulate in place: each pass produces a full-size image, so holding
+        // all four at once would be four times the largest allocation here.
+        std::vector<float> acc, one, src;
+        const size_t n = size_t(pw) * kAiScale * ph * kAiScale * 3;
+        try { acc.assign(n, 0.0f); src.resize(size_t(pw) * ph * 4); }
+        catch (const std::bad_alloc&) { err = "not enough memory to denoise"; return false; }
+
+        for (int p = 0; p < passes; ++p) {
+            const Symmetry& sym = kSyms[p];
+            const int tw = sym.transpose ? ph : pw;   // transformed plane size
+            const int th = sym.transpose ? pw : ph;
+
+            for (int c = 0; c < 4; ++c) {
+                const float* sp = packed + size_t(c) * pw * ph;
+                float* dp = src.data() + size_t(c) * pw * ph;
+                for (int y = 0; y < th; ++y)
+                    for (int x = 0; x < tw; ++x) {
+                        int sx, sy; map_src(sym, x, y, tw, th, sx, sy);
+                        dp[size_t(y) * tw + x] = sp[size_t(sy) * pw + sx];
+                    }
+            }
+
+            auto sub = progress ? std::function<bool(float)>(
+                [&](float f) { return progress((p + f) / (float)passes); })
+                                : std::function<bool(float)>();
+            if (!run(src.data(), tw, th, one, err, sub, /*ensemble=*/false))
+                return false;
+
+            // Undo the symmetry while accumulating, and exchange R/B where the
+            // transform moved them.
+            const int ow = tw * kAiScale, oh = th * kAiScale;
+            const int fw = pw * kAiScale;
+            for (int y = 0; y < oh; ++y)
+                for (int x = 0; x < ow; ++x) {
+                    int dx, dy; map_src(sym, x, y, ow, oh, dx, dy);
+                    const float* s = &one[(size_t(y) * ow + x) * 3];
+                    float* d = &acc[(size_t(dy) * fw + dx) * 3];
+                    d[0] += sym.swap_rb ? s[2] : s[0];
+                    d[1] += s[1];
+                    d[2] += sym.swap_rb ? s[0] : s[2];
+                }
+        }
+        const float inv = 1.0f / (float)passes;
+        for (float& v : acc) v *= inv;
+        out = std::move(acc);
+        VCE_LOGI("ViewMage", "self-ensemble: %d valid symmetries averaged", passes);
+        return true;
+    }
 
     const int ow = pw * kAiScale, oh = ph * kAiScale;
     const size_t in_plane = size_t(pw) * ph;

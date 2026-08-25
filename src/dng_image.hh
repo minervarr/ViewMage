@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <cstdint>
 #include <vector>
 
@@ -71,4 +72,5 @@ struct NoiseModel {
 DecodedImage decode_dng(const uint8_t* data, size_t size, uint32_t maxDimension,
                         WorkingPrimaries primaries = WorkingPrimaries::Srgb,
                         NoiseModel* out_noise = nullptr,
-                        class RawDenoiser* denoiser = nullptr);
+                        class RawDenoiser* denoiser = nullptr,
+                        std::function<bool(float)> progress = {});

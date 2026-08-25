@@ -72,9 +72,22 @@ public:
     //
     // `progress` is called with 0..1 between tiles; use it to drive a readout or
     // to abort by returning false.
+    // `ensemble` runs the SELF-ENSEMBLE: the same frame through the four
+    // symmetries that keep a Bayer mosaic's phase exact, averaged. Four times
+    // the compute for measurably less noise at the same detail -- on a real
+    // night frame, roughness 0.0143 -> 0.0103 (-28%) while detail fell only 15%.
+    //
+    // Only FOUR, not the usual eight. A 90-degree rotation turns RGGB into GBRG
+    // and there is no plane permutation that undoes it, so feeding one hands the
+    // model a phase it was never trained on. Averaging those looks like it wins
+    // -- it scored best on a crude detail/noise ratio -- but what it actually
+    // does is average mis-registered predictions, which is blur wearing a
+    // denoiser's clothes. Identity, transpose, 180 and anti-transpose are the
+    // whole valid set.
     bool run(const float* packed, int pw, int ph,
              std::vector<float>& out, std::string& err,
-             const std::function<bool(float)>& progress = {});
+             const std::function<bool(float)>& progress = {},
+             bool ensemble = true);
 
     // Which execution provider the session actually got ("CPU", "XNNPACK", ...).
     const std::string& provider() const { return provider_; }
@@ -96,6 +109,21 @@ private:
 // `cfa` is the DNG CFA code (0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR). `black` is per CFA
 // element in raster order, matching RawMeta. Output is clipped to [0,1]: the
 // model is trained on that range.
+//
+// FORCE_RGGB. The model is trained on RGGB and its PixelShuffle output head
+// reconstructs at FIXED sub-pixel positions, so it cares about the 2x2 cell's
+// spatial phase and not only about which plane holds which colour. Packing a
+// GBRG sensor by colour alone puts R and B one sensor row away from where the
+// model expects them; the reconstruction then lands the chroma off by a pixel,
+// which shows up as magenta/cyan fringing on every high-contrast edge and as
+// low-frequency mottling in flat areas. The manifest's `bayer_orientation:
+// force_rggb` is exactly this instruction.
+//
+// The fix is a crop of at most one row and one column: the offset in {0,1}^2 at
+// which the pattern reads RGGB. `ox`/`oy` report it, because the returned planes
+// then describe the mosaic starting at (ox, oy) and the caller has to line the
+// result up with the full-size image again.
 void pack_bayer_rggb(const uint16_t* mosaic, int w, int h, int stride_px,
                      int cfa, const double black[4], double white,
-                     std::vector<float>& packed, int& pw, int& ph);
+                     std::vector<float>& packed, int& pw, int& ph,
+                     int& ox, int& oy);
