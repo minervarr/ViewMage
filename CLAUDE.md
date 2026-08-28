@@ -214,19 +214,63 @@ bit-exact against it from the packed array onward (max abs diff `0.000e+00` over
 
 - **Plane order `[R, G1, G2, B]`**, G1 being the first green in raster order.
 - **Mirror-padded tiles, overlap TRIMMED not blended** — `T=512, overlap=64,
-  step=384`, geometry baked into the ONNX export, not tunable.
+  step=384`, geometry baked into the ONNX export, not tunable. A feathered
+  cross-fade across the seam was tried and REVERTED: it blended the tiles'
+  least-trusted rim band (where context is mirrored data), and distant detail
+  read "blocky, like a resolution loss". `viewmage_cli --compare` measures
+  this — grid-on vs mid-tile Laplacian strips — and it is the tripwire for
+  any future return to blending.
+- **The ensemble is self-regularized against its own disagreement.** Averaging
+  four symmetry passes leaves per-pixel disagreement as spurious fine energy,
+  and measured on the patch grid its strength is ERRATIC across scene content
+  (0.13x..2.61x of Malvar's Laplacian between far patches): spatially
+  incoherent texture is what read as "blocky/pixel art on distant objects".
+  ai_denoise.cc therefore accumulates pass SQUARES alongside the mean and
+  soft-thresholds each pixel's high band by kSpeckleK x cross-pass std before
+  gain match: coefficients the passes could not agree on vanish, anything
+  stronger survives. (A Wiener-style GAIN was tried first and rejected — it
+  flattened whole weak patches toward their local mean, 0.04x..0.5x mush.)
+  Post-threshold the base sits at a consistent ~0.45-0.75x Malvar, so dng_image
+  applies the detail layer to BOTH modes: single-pass returns the full 1.0
+  (compensation for what one pass smooths away), the ensemble 0.55 (top-up on
+  a now-consistent base). Patch-grid targets, and what shipped: weak-detail
+  cells ~0.5-1.05x Malvar, textured ~0.6-1.26x — one tight band, versus the
+  old outlier pair {single 71%, ensemble ±160%}.
 - **One global gain match after stitching** (`mean(in)/mean(out)`). The net emits
   an arbitrary learned scale (`match_gain=output` at training). Skip it and every
   photo is the wrong brightness. Per tile instead of globally gives each tile its
   own exposure.
+- **The output tensor is NCHW PLANAR** — `[1,3,1024,1024]` means three full
+  `1024*1024` planes, R then G then B, NOT interleaved RGB pixels. The first
+  version read it interleaved (`got[si*3+c]`), which pulls each "channel" from a
+  different spatial location in the wrong plane; the develop came out near-grey
+  AND mosaicked — the same frame reading as "a grid of multiple scenes" — because
+  scrambling planes scrambles space as well as colour. Nothing crashed, the gain
+  match still produced plausible-looking numbers, and only a synthetic flat-field
+  test (feed R≠G≠B, check what comes back) exposed it. `load()` now validates the
+  output shape too, so a model that would reintroduce this fails loudly instead.
 
 **Never feed it white-balanced data.** It was trained unbalanced; `g[]` stays
 strictly downstream. This is the single easiest thing to "tidy" into a silent
 quality regression.
 
-Highlight reconstruction is **approximate on the AI path**: the pack clips input
-to [0,1], so a blown channel arrives at the ceiling rather than above it. The two
-paths are not identical there.
+Highlight reconstruction on the AI path is **mask-guided, not guessed**: the pack
+emits a per-photosite clip mask (`pack_bayer_rggb`'s `clip_mask`) recording which
+channels measured at or above white BEFORE the [0,1] clamp flattened them. The
+develop uses it to raise clipped channels to the brightest unclipped one — post
+white balance, so a fully-clipped core lands exactly neutral instead of magenta
+— and to suppress invented chroma in the fringe ring. Why it must exist: fed the
+ceiling-flat core, the model invents ratios there. Measured with `viewmage_cli
+--analyze` (ring R/G,B/G around LED blooms) on a night frame: a cyan LED's B/G
+went 2.9 -> 4.2 and an orange lamp's core collapsed to R/G 0.95 / B/G 0.02; with
+the mask every bloom core develops at 1.00/1.00. The Malvar path never needed
+this — its knee ramp reads the pre-demosaic values directly.
+
+**Lateral CA is a separate, live artifact.** The camera writes no OpcodeList, so
+nothing corrects it end-to-end; measured R-vs-G bright-mask centroids sit ~2 px
+apart on this lens. Mask-guided suppression does not touch it. Geometric
+realignment without lens calibration was considered and deferred — it risks
+repainting genuinely coloured scenes grey.
 
 **The self-ensemble is x4, and x8 is WRONG here.** `run(..., ensemble=true)`
 averages the frame through the four symmetries that keep a Bayer cell's phase
@@ -279,18 +323,20 @@ Neither the 31 MB model nor the 17 MB ORT `.so` is in git; `tools/fetch_model.sh
 (pinned tag + SHA-256) and `tools/fetch_onnxruntime.sh` fetch them, and CMake
 warns and builds without the denoise when they are absent (`VIEWMAGE_WITH_ORT`).
 
-## The POST bar and PNG export
+## The POST bar and PNG/JPEG export
 
-`src/png_export.{hh,cc}` plus the bottom bar in `viewmage_app.cc`'s `draw()`.
-One status line and one button, because the render is automatic — there is
-nothing to adjust, and anything more would be a photo editor, which this is
-deliberately not.
+`gui/src/png_export.{hh,cc}` plus the bottom bar in `viewmage_app.cc`'s `draw()`.
+One status line and four buttons — Save PNG, Save JPG, Denoise, Enhance — because
+the render is automatic: there is nothing to adjust, and anything more would be a
+photo editor, which this is deliberately not. The two save buttons are the
+explicit format choice; same pixels, same render, one container each.
 
 The export writes **8-bit sRGB**, which is a real loss of range and still the
 right choice: 16-bit PQ renders as a washed, too-dark picture in anything that
 is not colour-managed (the complaint that started all this), and JXL cannot be
-decoded by the phone that shot the photo. The DNG remains the archive; the PNG
-is the copy you send. What is written is **what was on screen** — same exposure,
+decoded by the phone that shot the photo. The DNG remains the archive; the export
+is the copy you send (JPEG at q95 is ~4.5x smaller than the PNG for chat apps).
+What is written is **what was on screen** — same exposure,
 same tone curve, same rolloff — so `rolloff()` here MIRRORS `image_frag.slang`
 and vk_canvas's `rolloffCurve()`. Change one, change all three.
 
@@ -299,9 +345,17 @@ negatives are clamped **before** the luminance dot product (otherwise
 out-of-gamut speculars go magenta), and BT.2020 luma weights are used on wide
 pixels (709's weights skew the ratio per hue and reappear as a green cast).
 
+**Quantisation is DITHERED** (`export_math::to_srgb8_dithered` +
+`kBayerDither`, shared by PNG, JPEG and the CLI): an ordered 4x4 Bayer offset
+added before truncation dissolves gradient banding. Proof by narrow ramp: a
+1.5-code-value sweep went from a 255-px flat run to a 34-px longest run. The
+first version divided the table by 255 AND added it after the x255 scale — a
+no-op dither that only a unit-level ramp test exposed, which is why the proof
+script exists.
+
 **Save is inert until the denoise lands.** The refinement takes ~26 s, and
 during it the pixels on screen are the ordinary demosaic. Exporting then hands
-the user a PNG with ~7x the shadow noise of the finished render and nothing in
+the user a file with ~7x the shadow noise of the finished render and nothing in
 the file to say it was the wrong one — which is exactly what happened in
 testing. The button is dimmed while `refine_thread_` is in flight and
 `doExport()` refuses independently, because the check that matters belongs next
@@ -351,6 +405,36 @@ button did nothing. `draw()` logs the rect once (`Save button at x,y wxh`)
 because `adb screencap` returns an all-zero PNG on HDR content, so the control
 cannot be seen. **Add 125 to the logged y to get where to inject, and never
 treat a passing injected tap as proof a control is reachable.**
+
+**An injected tap can also land NOWHERE: if `dumpsys input` shows the app
+window's `touchableRegion=<empty>`, every tap dies silently.** Seen after
+re-launching an already-running activity with `am start`; a cold start
+(force-stop first) re-registers the region. Check that line before blaming
+coordinates.
+
+## Enhance — finishing, deliberately thin
+
+`core/src/enhance.{hh,cc}`. Vibrance (muted colours boosted, saturated ones
+knee-protected) plus luminance-only unsharp sharpening with a SOFT dead-zone
+gate and an overshoot cap.
+
+Two things were removed or changed for cause:
+
+- **No contrast curve.** Enhance used to stack an ACES approximation on top of
+  the develop's own toe — two tone maps, then the shader/export rolloff made
+  three. ACES lifts mid grey ~30%, which re-shuffled tonality the develop had
+  already placed and flattened highlights into patches ("colours not like real
+  life"). Contrast belongs to exactly one stage; here that stage is the develop.
+- **The hard noise gate became soft, and it was THE "pixel art" bug.** A binary
+  `|detail| > floor ? detail : 0` on smooth highlight gradients flickers
+  per-pixel between full strength and zero — a staircase baked into the image.
+  The gate now smoothsteps across a band twice the noise-floor wide.
+
+Sharpening is SKIPPED entirely when Enhance runs after a denoise (`denoised_`
+zeroes `sharpen` in viewmage_app.cc): the network already reconstructs edge
+detail, and unsharp-masking its output re-invents halos around every light.
+Luma weights follow the working gamut (BT.2020 on the phone path) — the same
+green-cast rule as everywhere else.
 
 ## The display tone curve
 

@@ -14,7 +14,8 @@ mkdir -p "$OUT"
 
 echo "== view_transform_test =="
 g++ -std=c++17 -O1 -Wall -o "$OUT/view_transform_test" \
-    view_transform_test.cc ../src/view_transform.cc
+    ../core/tests/view_transform_test.cc ../core/src/view_transform.cc \
+    -I ../core/include
 "$OUT/view_transform_test"
 
 # The tone curve lives in vk_canvas, and so does its test — but vk_canvas only
@@ -40,8 +41,8 @@ fi
 # skipping it. Pass a real .dng as $1 to also develop that.
 echo "== dng_image_test =="
 g++ -std=c++17 -O1 -Wall -o "$OUT/dng_image_test" \
-    dng_image_test.cc ../src/dng_image.cc ../src/decoded_image.cc ../src/ai_denoise.cc \
-    -I ../src -I ../framework/vk_canvas/core
+    ../core/tests/dng_image_test.cc ../core/src/dng_image.cc ../core/src/decoded_image.cc ../core/src/ai_denoise.cc \
+    -I ../core/src -I ../core/include -I ../framework/vk_canvas/core
 "$OUT/dng_image_test" ${1:+"$1"}
 
 echo "== jxl_image_test =="
@@ -50,6 +51,7 @@ if ! pkg-config --exists libjxl libjxl_threads libjxl_cms; then
     exit 0
 fi
 g++ -std=c++17 -O1 -Wall -o "$OUT/jxl_image_test" \
-    jxl_image_test.cc ../src/jxl_image.cc ../src/decoded_image.cc -I ../src -I ../framework/vk_canvas/core \
+    ../core/tests/jxl_image_test.cc ../core/src/jxl_image.cc ../core/src/decoded_image.cc \
+    -I ../core/src -I ../core/include -I ../framework/vk_canvas/core \
     $(pkg-config --cflags --libs libjxl libjxl_threads libjxl_cms)
-"$OUT/jxl_image_test" .
+"$OUT/jxl_image_test" ../core/tests

@@ -1,0 +1,150 @@
+# ---------------------------------------------------------------------------
+# ViewMage — Android shared library. Thin wrapper that builds on the portable
+# core and app (viewmage_core static lib + gui sources) and links the Android
+# platform layer.
+# ---------------------------------------------------------------------------
+cmake_minimum_required(VERSION 3.22.1)
+
+# ── Submodules ───────────────────────────────────────────────────────────────
+# CMAKE_SOURCE_DIR is the directory of the top-level CMakeLists.txt, which AGP
+# sets to android/ when invoked from the Gradle build.  Probe upward so that
+# REPO_ROOT always lands at the project root regardless of which CMakeLists.txt
+# cmake considers "top-level".
+set(_probe ${CMAKE_SOURCE_DIR})
+while(NOT EXISTS ${_probe}/thirdparty/libjxl/CMakeLists.txt)
+    get_filename_component(_probe "${_probe}" DIRECTORY)
+    if(_probe STREQUAL "")
+        message(FATAL_ERROR "Cannot find project root (thirdparty/libjxl)")
+    endif()
+endwhile()
+set(REPO_ROOT ${_probe})
+set(APP_SHELL_DIR ${REPO_ROOT}/framework/app_shell)
+set(VK_CANVAS_DIR ${REPO_ROOT}/framework/vk_canvas CACHE PATH "vk_canvas root")
+
+# ── libjxl (third party — configured, never modified) ────────────────────────
+set(LIBJXL_DIR ${REPO_ROOT}/thirdparty/libjxl)
+
+if(NOT EXISTS ${LIBJXL_DIR}/CMakeLists.txt)
+    message(FATAL_ERROR
+        "thirdparty/libjxl is empty. Run: git submodule update --init --recursive")
+endif()
+
+set(BUILD_TESTING                 OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS             OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_TOOLS           OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_VIEWERS         OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_EXAMPLES        OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_MANPAGES        OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_BENCHMARK       OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_DEVTOOLS        OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_FUZZERS         OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_JNI             OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_PLUGINS         OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_OPENEXR         OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_SJPEG           OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_TCMALLOC        OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_COVERAGE        OFF CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_SKCMS           ON  CACHE BOOL "" FORCE)
+set(JPEGXL_BUNDLE_SKCMS           ON  CACHE BOOL "" FORCE)
+set(JPEGXL_ENABLE_TRANSCODE_JPEG  OFF CACHE BOOL "" FORCE)
+set(JPEGXL_STATIC                 OFF CACHE BOOL "" FORCE)
+set(JPEGXL_WARNINGS_AS_ERRORS     OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_TESTS              OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_EXAMPLES           OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_CONTRIB            OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_INSTALL            OFF CACHE BOOL "" FORCE)
+
+# libjxl is ALWAYS optimised, even in a Debug build — see root CMakeLists.txt.
+set(_saved_c_debug   "${CMAKE_C_FLAGS_DEBUG}")
+set(_saved_cxx_debug "${CMAKE_CXX_FLAGS_DEBUG}")
+set(CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG} -O2")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2")
+add_subdirectory(${LIBJXL_DIR} ${CMAKE_BINARY_DIR}/libjxl EXCLUDE_FROM_ALL)
+set(CMAKE_C_FLAGS_DEBUG   "${_saved_c_debug}")
+set(CMAKE_CXX_FLAGS_DEBUG "${_saved_cxx_debug}")
+
+# ── ONNX Runtime (prebuilt import) ──────────────────────────────────────────
+set(ORT_DIR ${REPO_ROOT}/thirdparty/onnxruntime)
+set(VIEWMAGE_HAS_ORT OFF)
+if(EXISTS ${ORT_DIR}/lib/${ANDROID_ABI}/libonnxruntime.so)
+    add_library(onnxruntime SHARED IMPORTED)
+    set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION
+        ${ORT_DIR}/lib/${ANDROID_ABI}/libonnxruntime.so)
+    target_include_directories(onnxruntime INTERFACE ${ORT_DIR}/include)
+    set(VIEWMAGE_HAS_ORT ON)
+else()
+    message(WARNING
+        "thirdparty/onnxruntime is missing — building WITHOUT the neural raw "
+        "denoiser. Run tools/fetch_onnxruntime.sh to enable it.")
+endif()
+
+# ── Core library (portable) ─────────────────────────────────────────────────
+set(VIEWMAGE_HAS_ORT ${VIEWMAGE_HAS_ORT} CACHE BOOL "" FORCE)
+add_subdirectory(${REPO_ROOT}/core ${CMAKE_BINARY_DIR}/core)
+
+# ── Shaders ──────────────────────────────────────────────────────────────────
+include(${VK_CANVAS_DIR}/cmake/VceShaders.cmake)
+set(SHADER_OUT ${REPO_ROOT}/app/src/main/assets/shaders)
+vce_compile_slang(compile_font_shaders ${SHADER_OUT}
+    ${VK_CANVAS_DIR}/first_party/vulkan_font_engine/shaders_src
+    composite_vert composite_frag tiling coverage)
+vce_compile_slang(compile_canvas_shaders ${SHADER_OUT}
+    ${VK_CANVAS_DIR}/shaders_src
+    overlay_vert overlay_frag image_vert image_frag)
+
+# ── ui_min_text_size.gen.h (placeholder — ViewMage uses no fonts) ────────────
+set(_gen_dir ${CMAKE_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${_gen_dir})
+file(WRITE ${_gen_dir}/ui_min_text_size.gen.h
+"#pragma once\n"
+"// GENERATED by ViewMage's android/CMakeLists.txt\n"
+"static constexpr float kMinReadableTextSizePx = 12.0f;\n")
+
+# ── app_shell (Android) ─────────────────────────────────────────────────────
+set(APP_SHELL_APP_NAME "viewmage" CACHE STRING "" FORCE)
+set(APP_SHELL_WINDOW_TITLE "ViewMage" CACHE STRING "" FORCE)
+set(APP_SHELL_APP_ID "io.nava.viewmage" CACHE STRING "" FORCE)
+set(APP_SHELL_NATIVE_APP_GLUE_DIR ${ANDROID_NDK}/sources/android/native_app_glue)
+add_subdirectory(${APP_SHELL_DIR} ${CMAKE_BINARY_DIR}/app_shell)
+
+# ── vk_canvas_core ───────────────────────────────────────────────────────────
+add_subdirectory(${VK_CANVAS_DIR}/core ${CMAKE_BINARY_DIR}/vk_canvas_core)
+
+# ── The application shared library ───────────────────────────────────────────
+add_library(viewmage SHARED
+    src/main.cc
+    ${REPO_ROOT}/gui/src/viewmage_app.cc
+    ${REPO_ROOT}/gui/src/png_export.cc
+    ${VK_CANVAS_DIR}/platform/android/android_platform.cc
+    ${APP_SHELL_NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
+)
+
+add_dependencies(viewmage compile_font_shaders compile_canvas_shaders)
+
+target_include_directories(viewmage PRIVATE
+    ${REPO_ROOT}/gui/src
+    ${REPO_ROOT}/core/include
+    ${REPO_ROOT}/thirdparty/stb
+    ${APP_SHELL_NATIVE_APP_GLUE_DIR}
+    ${VK_CANVAS_DIR}/platform/android
+    ${LIBJXL_DIR}/lib/include
+    ${CMAKE_BINARY_DIR}/libjxl/lib/include
+)
+
+target_compile_options(viewmage PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O2>)
+
+target_link_libraries(viewmage PRIVATE
+    viewmage_core
+    app_shell_android
+    vk_canvas_core
+    android
+    log
+    vulkan
+)
+
+if(VIEWMAGE_HAS_ORT)
+    target_link_libraries(viewmage PRIVATE onnxruntime)
+    target_compile_definitions(viewmage PRIVATE VIEWMAGE_WITH_ORT)
+endif()
+
+target_link_options(viewmage PRIVATE -u ANativeActivity_onCreate)
