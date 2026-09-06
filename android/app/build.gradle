@@ -60,7 +60,12 @@ android {
     sourceSets {
         main {
             java.srcDirs += '../../framework/app_shell/platform/android/java'
-            assets.srcDirs += '../../assets'
+            // A STAGED directory, not the repo's assets/ tree. assets/fonts is
+            // the shared `fonts` submodule (127 MiB) and viewmage_app.cc opens
+            // exactly one face out of it; listing the tree here put every face
+            // in the workspace into the APK. models/ is unaffected — it lives
+            // in this module's own assets/ and is gitignored.
+            assets.srcDirs += "${buildDir}/generated/viewmage_assets"
         }
     }
 
@@ -92,4 +97,19 @@ android {
     lint {
         disable 'ExpiredTargetSdkVersion'
     }
+}
+
+
+// Stage the single face viewmage_app.cc opens, so the APK carries it and not
+// the whole shared fonts submodule. AGP merges assets before the native build
+// runs, so this must be a Gradle task mergeAssets depends on.
+def stageViewMageAssets = tasks.register('stageViewMageAssets', Copy) {
+    into "${buildDir}/generated/viewmage_assets"
+    from('../../assets/fonts/newcomputermodern') {
+        include 'NewCMSans10-Regular.otf'
+        into 'fonts/newcomputermodern'
+    }
+}
+tasks.matching { it.name ==~ /merge.*Assets/ }.configureEach {
+    dependsOn stageViewMageAssets
 }

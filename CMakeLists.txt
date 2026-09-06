@@ -80,12 +80,16 @@ set(APP_SHELL_APP_NAME "viewmage" CACHE STRING "" FORCE)
 set(APP_SHELL_WINDOW_TITLE "ViewMage" CACHE STRING "" FORCE)
 add_subdirectory(${APP_SHELL_DIR} ${CMAKE_BINARY_DIR}/app_shell)
 
-# app_shell's Debug tests depend on generate_ui_min_text_size, which normally
-# comes from app_shell_generate_min_text_size(). ViewMage ships no fonts, so
-# create the target as a no-op after app_shell is configured.
-add_custom_target(generate_ui_min_text_size ALL
-    COMMAND ${CMAKE_COMMAND} -E true
-    COMMENT "ui_min_text_size: no-op (ViewMage ships no fonts)")
+# The build-time text-size floor, computed from the geometry of the faces this
+# app actually opens. That is one face: gui/src/viewmage_app.cc reads
+# fonts/newcomputermodern/NewCMSans10-Regular.otf through the dataReader seam.
+#
+# This used to be a no-op stub, on the belief that ViewMage shipped no fonts. It
+# did ship them and it does open one, so the floor was never computed and UI
+# text had no measured minimum legible size to be held above.
+include(${APP_SHELL_DIR}/cmake/AppShellMinTextSize.cmake)
+app_shell_generate_min_text_size(
+    ${CMAKE_SOURCE_DIR}/assets/fonts/newcomputermodern/NewCMSans10-Regular.otf)
 add_dependencies(ui_metrics_test generate_ui_min_text_size)
 
 # ── vk_canvas_core ───────────────────────────────────────────────────────────
