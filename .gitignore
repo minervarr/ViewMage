@@ -29,5 +29,6 @@ compile_commands.json
 # tools/ rather than versioned. Binaries do not belong in git, and both are
 # reproducible from a pinned upstream release.
 app/src/main/assets/models/
+android/app/src/main/assets/models/page_quad.onnx
 thirdparty/onnxruntime/include/
 thirdparty/onnxruntime/lib/

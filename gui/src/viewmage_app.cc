@@ -1,11 +1,14 @@
 #include "viewmage_app.hh"
 
 #include "png_export.hh"
+#include "text_util.hh"    // truncateToWidth: status text must never overlap buttons
+#include "text_font.hh"    // FontStyle::Roman (full definition, not the forward decl)
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <exception>
 
 #include "log.hh"
 #ifdef __ANDROID__
@@ -58,6 +61,7 @@ float distance(float ax, float ay, float bx, float by) {
 ViewMageApp::ViewMageApp(std::unique_ptr<Host> host) : host_(std::move(host)) {}
 
 ViewMageApp::~ViewMageApp() {
+    joinScan();
     joinEnhancement();
     joinRefinement();
     releaseTexture();
@@ -130,12 +134,22 @@ void ViewMageApp::run() {
     while (running_) {
         const bool refining = refine_thread_.joinable() && !refined_ready_.load();
         const bool enhancing = enhance_thread_.joinable() && !enhanced_ready_.load();
-        const bool busy = refining || enhancing;
+        const bool scanning = scan_thread_.joinable() && !scan_ready_.load();
+        const bool busy = refining || enhancing || scanning;
         // Also force a draw when a result is ready to pick up — without this,
         // refined_ready_==true makes refining==false, busy==false, pump blocks,
         // and pollRefinement() is never reached.
-        const bool hasResult = refined_ready_.load() || enhanced_ready_.load();
+        const bool hasResult = refined_ready_.load() || enhanced_ready_.load() ||
+                               scan_ready_.load();
         if (busy || hasResult) dirty_ = true;
+        // Hold the screen on for the whole job. A denoise is long enough that
+        // the panel would otherwise sleep, and Android then freezes or kills
+        // the process with the photo only in memory.
+        const bool awake = busy || hasResult;
+        if (awake != keepAwake_) {
+            keepAwake_ = awake;
+            host_->setKeepAwake(awake);
+        }
         host_->pump(/*haveWork=*/dirty_ || busy || hasResult);
         // Don't exit while a worker is in flight.
         if (host_->quitRequested() && !busy) break;
@@ -143,6 +157,7 @@ void ViewMageApp::run() {
 
         pollRefinement();
         pollEnhancement();
+        pollScan();
 
         if (dirty_ && surfaceOk_ && renderer_) {
             draw();
@@ -153,8 +168,13 @@ void ViewMageApp::run() {
 
 void ViewMageApp::shutdown() {
     running_ = false;
+    joinScan();
     joinEnhancement();
     joinRefinement();
+    if (keepAwake_) {
+        keepAwake_ = false;
+        if (host_) host_->setKeepAwake(false);
+    }
 }
 
 // ── Progressive refinement ──────────────────────────────────────────────────
@@ -178,40 +198,86 @@ void ViewMageApp::startRefinement() {
     VCE_LOGI("ViewMage", "neural denoise: started in the background");
 
     refine_thread_ = std::thread([this, maxDim, prim] {
-        // Building the session is the expensive half -- on an S23 Ultra it is
-        // minutes, not seconds, which is exactly why it lives on this thread.
-        if (!denoiser_) {
-            const double t0 = nowSeconds();
-            std::string err;
-            denoiser_ = RawDenoiser::load(model_bytes_.data(), model_bytes_.size(), err);
+        // Every exit stores an image and sets refined_ready_. A bare return
+        // leaves the thread joinable with the flag still false, and the UI
+        // treats that as "still denoising" with every button disabled.
+        auto publish = [this](DecodedImage img) {
+            {
+                std::lock_guard<std::mutex> lock(refined_mutex_);
+                refined_ = std::move(img);
+            }
+            refined_ready_.store(true);
+        };
+        auto fail = [](const std::string& why) {
+            DecodedImage img;
+            img.error = why;
+            return img;
+        };
+        try {
+            // Building the session is the expensive half -- on an S23 Ultra it is
+            // minutes, not seconds, which is exactly why it lives on this thread.
             if (!denoiser_) {
-                VCE_LOGE("ViewMage", "denoiser unavailable: %s", err.c_str());
+                const double t0 = nowSeconds();
+                std::string err;
+                denoiser_ = RawDenoiser::load(model_bytes_.data(), model_bytes_.size(), err);
+                if (!denoiser_) {
+                    VCE_LOGE("ViewMage", "denoiser unavailable: %s", err.c_str());
+                    publish(fail(err.empty() ? "denoiser unavailable" : err));
+                    return;
+                }
+                VCE_LOGI("ViewMage", "denoiser ready (%s) in %.1f s",
+                         denoiser_->provider().c_str(), nowSeconds() - t0);
+            }
+            if (refine_abort_.load()) {
+                publish(fail("cancelled"));
                 return;
             }
-            VCE_LOGI("ViewMage", "denoiser ready (%s) in %.1f s",
-                     denoiser_->provider().c_str(), nowSeconds() - t0);
-        }
-        if (refine_abort_.load()) return;
-        const double t1 = nowSeconds();
+            const double t1 = nowSeconds();
 
-        // decode_dng again rather than trying to re-enter the develop halfway:
-        // the develop is a few hundred milliseconds against the denoise's tens
-        // of seconds, and a second full decode is far easier to reason about
-        // than a pipeline that can be resumed from the middle.
-        DecodedImage out = decode_dng(source_.data(), source_.size(), maxDim,
-                                      prim, nullptr, denoiser_.get(),
-                                      [this](float f) {
-                                          refine_progress_.store(f);
-                                          return !refine_abort_.load();
-                                      });
-        if (refine_abort_.load()) return;
-        VCE_LOGI("ViewMage", "neural denoise: %.1f s for %ux%u",
-                 nowSeconds() - t1, out.w, out.h);
-        {
-            std::lock_guard<std::mutex> lock(refined_mutex_);
-            refined_ = std::move(out);
+            // decode_dng again rather than trying to re-enter the develop halfway:
+            // the develop is a few hundred milliseconds against the denoise's tens
+            // of seconds, and a second full decode is far easier to reason about
+            // than a pipeline that can be resumed from the middle.
+            DecodedImage out = decode_dng(source_.data(), source_.size(), maxDim,
+                                          prim, nullptr, denoiser_.get(),
+                                          [this](float f) {
+                                              refine_progress_.store(f);
+                                              return !refine_abort_.load();
+                                          });
+            if (refine_abort_.load() || out.error == "cancelled") {
+                publish(fail("cancelled"));
+                return;
+            }
+            if (!out.ok()) {
+                VCE_LOGE("ViewMage", "neural denoise failed: %s", out.error.c_str());
+                publish(std::move(out));
+                return;
+            }
+            // decode_dng falls back to Malvar and still returns a picture. The
+            // screen already shows that develop; swapping in a second copy
+            // only risks the allocation that just failed.
+            bool fellBack = false;
+            for (const Diagnostic& n : out.notes) {
+                if (n.title == "Shown without neural denoise") fellBack = true;
+            }
+            if (fellBack) {
+                VCE_LOGE("ViewMage", "neural denoise fell back; keeping the develop");
+                publish(fail("denoise failed"));
+                return;
+            }
+            VCE_LOGI("ViewMage", "neural denoise: %.1f s for %ux%u",
+                     nowSeconds() - t1, out.w, out.h);
+            publish(std::move(out));
+        } catch (const std::bad_alloc&) {
+            VCE_LOGE("ViewMage", "neural denoise: out of memory");
+            publish(fail("not enough memory to denoise"));
+        } catch (const std::exception& e) {
+            VCE_LOGE("ViewMage", "neural denoise: %s", e.what());
+            publish(fail(e.what()));
+        } catch (...) {
+            VCE_LOGE("ViewMage", "neural denoise: unknown failure");
+            publish(fail("denoise failed"));
         }
-        refined_ready_.store(true);
     });
 }
 
@@ -239,12 +305,32 @@ std::string ViewMageApp::statusLine() const {
     if (!export_note_.empty()) return export_note_;
     if (exporting_)            return "Saving...";
     if (refine_thread_.joinable() && !refined_ready_.load()) {
+        if (refine_abort_.load()) return "Cancelling...";
         const int pct = (int)(refine_progress_.load() * 100.0f + 0.5f);
         return "Denoising " + std::to_string(pct) + "%";
     }
     if (enhance_thread_.joinable() && !enhanced_ready_.load())
         return "Enhancing...";
+    if (scan_thread_.joinable() && !scan_ready_.load())
+        return scan_flattening_ ? "Straightening..." : "Finding the page...";
+    if (scan_adjust_) {
+        if (placing_) return "Release to add a point";
+        if (drag_corner_ >= 0 &&
+            drag_corner_ < (int)adjust_outline_.points.size()) {
+            if (drag_handle_) {
+                const PagePointKind k = adjust_outline_.points[drag_corner_].kind;
+                if (k == PagePointKind::Fold) return "Release to straighten";
+                return "Drag onto the point to straighten";
+            }
+            if (pointRemoveArmed()) return "Release to remove";
+            const PagePointKind k = adjust_outline_.points[drag_corner_].kind;
+            if (k == PagePointKind::Corner) return "Corner";
+            return "Drag away to remove";
+        }
+        return scan_page_ ? "Four corners are the page" : "Tap a line to add";
+    }
     if (enhanced_)             return "Enhanced";
+    if (scanned_)              return "Page flattened";
     if (denoised_)             return "Denoised";
     return "Developed from RAW";
 }
@@ -253,6 +339,11 @@ void ViewMageApp::doExport(bool jpeg) {
     if (exporting_) return;
     if (refine_thread_.joinable() && !refined_ready_.load()) {
         export_note_ = "Still denoising";
+        dirty_ = true;
+        return;
+    }
+    if (scan_thread_.joinable() && !scan_ready_.load()) {
+        export_note_ = "Still straightening";
         dirty_ = true;
         return;
     }
@@ -314,7 +405,19 @@ void ViewMageApp::pollRefinement() {
         got = std::move(refined_);
     }
     if (!got.ok()) {
+        // The develop already on screen is the recovered state. Replacing it,
+        // or clearing the texture, is how a failed denoise becomes a black
+        // window the user cannot leave. If the surface was recreated mid-job
+        // the texture handle is gone and has to be put back from pixels_.
         VCE_LOGE("ViewMage", "neural denoise failed: %s", got.error.c_str());
+        if (surfaceOk_ && renderer_ && texture_ == kInvalidTexture &&
+            !pixels_.linear.empty() && !uploadTexture()) {
+            VCE_LOGE("ViewMage", "could not restore the develop after denoise");
+        }
+        export_note_ = (got.error == "cancelled")
+            ? "Denoise cancelled"
+            : "Denoise failed — photo unchanged";
+        dirty_ = true;
         return;
     }
 
@@ -337,6 +440,8 @@ void ViewMageApp::pollRefinement() {
         releaseTexture();
         pixels_ = std::move(previous);
         texture_ = old;
+        export_note_ = "Denoise failed — photo unchanged";
+        dirty_ = true;
         return;
     }
     if (old != kInvalidTexture) renderer_->destroy_texture(old);
@@ -385,14 +490,22 @@ void ViewMageApp::startEnhance() {
     const EnhanceParams params = enhance_params_;
     // The neural denoise already reconstructs edge detail the sensor never
     // had; unsharp-masking its output re-invents halos around every light.
-    // Sharpening is for the plain develop only.
+    // Sharpening is for the plain develop only. A flattened page takes a
+    // different finish: even paper, dark ink, colour kept.
     EnhanceParams effective = params;
     if (denoised_) effective.sharpen = 0.0f;
+    const bool document = scanned_;
 
-    enhance_thread_ = std::thread([this, snap = std::move(snapshot), effective]() mutable {
+    enhance_thread_ = std::thread([this, snap = std::move(snapshot), effective, document]() mutable {
         const double t0 = nowSeconds();
-        enhanceImage(snap.linear, snap.w, snap.h, effective,
-                     snap.widePrimaries);
+        if (document) {
+            enhanceDocument(snap.linear, snap.w, snap.h, snap.widePrimaries);
+            snap.autoEv = 0.0f;
+            snap.white = 1.0f;
+        } else {
+            enhanceImage(snap.linear, snap.w, snap.h, effective,
+                         snap.widePrimaries);
+        }
         if (enhance_abort_.load()) return;
         VCE_LOGI("ViewMage", "enhance: %.1f s for %ux%u",
                  nowSeconds() - t0, snap.w, snap.h);
@@ -449,6 +562,812 @@ void ViewMageApp::pollEnhancement() {
     dirty_ = true;
     VCE_LOGI("ViewMage", "enhance: swapped in (autoEV=%.2f white=%.2f)",
              ev_, white_);
+}
+
+void ViewMageApp::joinScan() {
+    scan_abort_.store(true);
+    if (scan_thread_.joinable()) scan_thread_.join();
+}
+
+void ViewMageApp::startScan(bool rectangle) {
+    if (scan_thread_.joinable() || scan_adjust_) return;
+    if (pixels_.linear.empty() || !pixels_.ok()) {
+        export_note_ = "Nothing to scan";
+        dirty_ = true;
+        return;
+    }
+
+    DecodedImage snapshot;
+    snapshot.w = pixels_.w;
+    snapshot.h = pixels_.h;
+    snapshot.linear = pixels_.linear;
+
+    scan_ready_.store(false);
+    scan_abort_.store(false);
+    scan_flattening_ = false;
+    scan_page_ = rectangle;
+    VCE_LOGI("ViewMage", "scan: looking for the page");
+
+    std::vector<uint8_t> pageModel;
+    if (rectangle)
+        host_->dataReader().read("models/page_quad.onnx", pageModel);
+
+    scan_thread_ = std::thread([this, snap = std::move(snapshot), rectangle,
+                                pageModel = std::move(pageModel)]() mutable {
+        DocumentDetect found = rectangle
+            ? detectRectangle(snap.linear.data(), snap.w, snap.h,
+                              pageModel.empty() ? nullptr : pageModel.data(),
+                              pageModel.size())
+            : detectDocument(snap.linear.data(), snap.w, snap.h);
+        if (scan_abort_.load()) return;
+        std::lock_guard<std::mutex> lock(scan_mutex_);
+        scan_result_ = {};
+        if (rectangle && found.found) {
+            DocumentQuad q = found.quad;
+            int nCorner = 0;
+            PagePoint corners[4];
+            for (const PagePoint& p : found.outline.points) {
+                if (p.kind != PagePointKind::Corner || nCorner >= 4) continue;
+                corners[nCorner++] = p;
+            }
+            if (found.outline.shape != DocumentShape::Quad) {
+                if (nCorner != 4) {
+                    found.found = false;
+                    found.error = "No rectangle found";
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        q.x[i] = corners[i].x;
+                        q.y[i] = corners[i].y;
+                    }
+                    found.outline = DocumentOutline{};
+                    found.outline.shape = DocumentShape::Quad;
+                    for (int i = 0; i < 4; ++i) {
+                        PagePoint c;
+                        c.kind = PagePointKind::Corner;
+                        c.x = q.x[i];
+                        c.y = q.y[i];
+                        found.outline.points.push_back(c);
+                        found.outline.x.push_back(c.x);
+                        found.outline.y.push_back(c.y);
+                    }
+                    found.quad = q;
+                }
+            }
+        }
+        if (!found.found) {
+            scan_has_quad_ = false;
+            scan_error_ = found.error.empty() ? "No document found" : found.error;
+            VCE_LOGI("ViewMage", "scan: %s", scan_error_.c_str());
+        } else {
+            scan_has_quad_ = true;
+            scan_quad_ = found.quad;
+            scan_outline_ = found.outline;
+            scan_error_.clear();
+            VCE_LOGI("ViewMage", "scan: corners ready");
+        }
+        scan_ready_.store(true);
+    });
+}
+
+void ViewMageApp::confirmScan() {
+    if (scan_thread_.joinable() || !scan_adjust_) return;
+    if (pixels_.linear.empty() || !pixels_.ok()) return;
+
+    DecodedImage snapshot;
+    snapshot.w = pixels_.w;
+    snapshot.h = pixels_.h;
+    snapshot.linear = pixels_.linear;
+    snapshot.autoEv = pixels_.autoEv;
+    snapshot.white  = pixels_.white;
+    snapshot.hdrTransfer   = pixels_.hdrTransfer;
+    snapshot.widePrimaries = pixels_.widePrimaries;
+    snapshot.bitsPerSample = pixels_.bitsPerSample;
+    DocumentQuad quad;
+    DocumentOutline outline = adjust_outline_;
+    const bool straight = outline.points.size() == 4 &&
+                          outline.shape == DocumentShape::Quad;
+    if (straight) {
+        for (int i = 0; i < 4; ++i) {
+            quad.x[i] = outline.points[i].x;
+            quad.y[i] = outline.points[i].y;
+        }
+    } else if (outline.points.empty()) {
+        for (int i = 0; i < 4; ++i) {
+            quad.x[i] = corner_x_[i];
+            quad.y[i] = corner_y_[i];
+        }
+    }
+    const DocumentShape shape = straight || outline.points.empty()
+                                    ? adjust_shape_ : outline.shape;
+
+    drag_corner_ = -1;
+    drag_handle_ = false;
+    placing_ = false;
+    scan_adjust_ = false;
+    scan_ready_.store(false);
+    scan_abort_.store(false);
+    scan_flattening_ = true;
+    VCE_LOGI("ViewMage", "scan: straightening");
+
+    scan_thread_ = std::thread([this, snap = std::move(snapshot), quad, shape, outline]() mutable {
+        const double t0 = nowSeconds();
+        const bool useQuad = shape == DocumentShape::Quad &&
+                             (outline.points.empty() || outline.points.size() == 4);
+        // Rect always rebuilds the four-corner page. A diamond or a circle
+        // on it is a bend, not a new corner. Shape follows the outline.
+        DocumentScan scan = scan_page_
+            ? reconstructRectangle(snap.linear.data(), snap.w, snap.h, outline)
+            : (useQuad
+                   ? flattenDocument(snap.linear.data(), snap.w, snap.h, quad)
+                   : flattenOutline(snap.linear.data(), snap.w, snap.h, outline));
+        if (scan_abort_.load()) return;
+        std::lock_guard<std::mutex> lock(scan_mutex_);
+        scan_has_quad_ = false;
+        if (!scan.found) {
+            scan_error_ = scan.error.empty() ? "Could not straighten the page" : scan.error;
+            scan_result_ = {};
+            VCE_LOGI("ViewMage", "scan: %s", scan_error_.c_str());
+        } else {
+            snap.linear = std::move(scan.linear);
+            snap.w = scan.w;
+            snap.h = scan.h;
+            // The photo's exposure was for the whole frame. Applied again it
+            // blows the paper out, because the paper was the bright part.
+            snap.autoEv = 0.0f;
+            snap.white = 1.0f;
+            scan_error_.clear();
+            scan_result_ = std::move(snap);
+            VCE_LOGI("ViewMage", "scan: %.2f s, page %ux%u",
+                     nowSeconds() - t0, scan_result_.w, scan_result_.h);
+        }
+        scan_ready_.store(true);
+    });
+}
+
+void ViewMageApp::pollScan() {
+    if (!scan_ready_.load()) return;
+    const bool flattening = scan_flattening_;
+    scan_ready_.store(false);
+    if (scan_thread_.joinable()) scan_thread_.join();
+
+    DocumentQuad quad;
+    bool hasQuad = false;
+    DecodedImage got;
+    std::string err;
+    {
+        std::lock_guard<std::mutex> lock(scan_mutex_);
+        hasQuad = scan_has_quad_;
+        quad = scan_quad_;
+        adjust_outline_ = scan_outline_;
+        adjust_shape_ = scan_outline_.shape;
+        got = std::move(scan_result_);
+        err = std::move(scan_error_);
+        scan_has_quad_ = false;
+    }
+    if (!flattening) {
+        if (!hasQuad) {
+            export_note_ = err.empty() ? "No document found" : err;
+            dirty_ = true;
+            return;
+        }
+        for (int i = 0; i < 4; ++i) {
+            corner_x_[i] = quad.x[i];
+            corner_y_[i] = quad.y[i];
+        }
+        drag_corner_ = -1;
+        scan_adjust_ = true;
+        export_note_.clear();
+        dirty_ = true;
+        return;
+    }
+    if (!got.ok()) {
+        scan_adjust_ = true;
+        export_note_ = err.empty() ? "Could not straighten the page" : err;
+        dirty_ = true;
+        return;
+    }
+    if (!surfaceOk_ || !renderer_) {
+        pendingScan_ = std::move(got);
+        return;
+    }
+
+    DecodedImage previous = std::move(pixels_);
+    const TextureHandle old = texture_;
+    texture_ = kInvalidTexture;
+    pixels_  = std::move(got);
+
+    if (!uploadTexture()) {
+        VCE_LOGE("ViewMage", "scan upload failed; keeping the previous picture");
+        releaseTexture();
+        pixels_ = std::move(previous);
+        texture_ = old;
+        export_note_ = "Could not show the page";
+        dirty_ = true;
+        return;
+    }
+    if (old != kInvalidTexture) renderer_->destroy_texture(old);
+    keep_pixels_ = true;
+    view_.setImage((int)pixels_.w, (int)pixels_.h);
+    syncViewport();
+    view_.fit();
+    scanned_ = true;
+    enhanced_ = false;
+    ev_ = pixels_.autoEv;
+    white_ = pixels_.white;
+    export_note_.clear();
+    dirty_ = true;
+    VCE_LOGI("ViewMage", "scan: swapped in %ux%u", pixels_.w, pixels_.h);
+}
+
+void ViewMageApp::imageToScreen(float ix, float iy, float& sx, float& sy) const {
+    const ViewTransform::Quad q = view_.quad();
+    if (pixels_.w == 0 || pixels_.h == 0 || q.w <= 0.0f || q.h <= 0.0f) {
+        sx = sy = 0.0f;
+        return;
+    }
+    sx = q.x + ix / (float)pixels_.w * q.w;
+    sy = q.y + iy / (float)pixels_.h * q.h;
+}
+
+void ViewMageApp::screenToImage(float sx, float sy, float& ix, float& iy) const {
+    const ViewTransform::Quad q = view_.quad();
+    if (pixels_.w == 0 || pixels_.h == 0 || q.w <= 0.0f || q.h <= 0.0f) {
+        ix = iy = 0.0f;
+        return;
+    }
+    ix = (sx - q.x) / q.w * (float)pixels_.w;
+    iy = (sy - q.y) / q.h * (float)pixels_.h;
+}
+
+
+
+void ViewMageApp::handleVector(int index, float& hx, float& hy) const {
+    hx = hy = 0.0f;
+    const auto& pts = adjust_outline_.points;
+    if (index < 0 || index >= (int)pts.size()) return;
+    const PagePoint& p = pts[index];
+    if (p.kind == PagePointKind::Corner) return;
+    const float len = std::sqrt(p.hx * p.hx + p.hy * p.hy);
+    if (p.kind == PagePointKind::Curve && len > 2.0f) {
+        hx = p.hx;
+        hy = p.hy;
+        return;
+    }
+    const int n = (int)pts.size();
+    const PagePoint& prev = pts[(index + n - 1) % n];
+    const PagePoint& next = pts[(index + 1) % n];
+    float tx = next.x - prev.x, ty = next.y - prev.y;
+    const float tl = std::sqrt(tx * tx + ty * ty);
+    if (tl < 1e-3f) return;
+    // A source-pixel arm is a few screen pixels once the page is fitted, and
+    // the stick disappears into the dot. Keep it a finger's width on screen.
+    const float scale = std::max(view_.scale(), 1e-3f);
+    // Long enough that the tip sits past the point's own grab, so a press
+    // on the diamond moves it instead of bending it.
+    const float arm = 96.0f / scale;
+    hx = tx / tl * arm;
+    hy = ty / tl * arm;
+}
+
+void ViewMageApp::syncShapeFromPoints() {
+    int folds = 0, curves = 0;
+    for (PagePoint& p : adjust_outline_.points) {
+        if (p.kind == PagePointKind::Curve) {
+            const float len = std::sqrt(p.hx * p.hx + p.hy * p.hy);
+            if (len < 1.0f) {
+                p.kind = PagePointKind::Fold;
+                p.hx = p.hy = 0.0f;
+            }
+        }
+        if (p.kind == PagePointKind::Fold) ++folds;
+        else if (p.kind == PagePointKind::Curve) ++curves;
+    }
+    if (curves) adjust_shape_ = DocumentShape::Curve;
+    else if (folds) adjust_shape_ = DocumentShape::Fold;
+    else if (adjust_outline_.points.size() == 3) adjust_shape_ = DocumentShape::Triangle;
+    else adjust_shape_ = DocumentShape::Quad;
+    adjust_outline_.shape = adjust_shape_;
+    adjust_outline_.ax.clear();
+    adjust_outline_.ay.clear();
+    adjust_outline_.bx.clear();
+    adjust_outline_.by.clear();
+    adjust_outline_.x.clear();
+    adjust_outline_.y.clear();
+    for (const PagePoint& p : adjust_outline_.points) {
+        adjust_outline_.x.push_back(p.x);
+        adjust_outline_.y.push_back(p.y);
+    }
+}
+
+void ViewMageApp::ensureAdjustPoints() {
+    if (!adjust_outline_.points.empty()) return;
+    for (int i = 0; i < 4; ++i) {
+        PagePoint p;
+        p.kind = PagePointKind::Corner;
+        p.x = corner_x_[i];
+        p.y = corner_y_[i];
+        adjust_outline_.points.push_back(p);
+    }
+    syncShapeFromPoints();
+}
+
+bool ViewMageApp::segmentScreen(int after, float& x0, float& y0,
+                                float& x1, float& y1) const {
+    const auto& pts = adjust_outline_.points;
+    if (!pts.empty()) {
+        if (after < 0 || after >= (int)pts.size()) return false;
+        const int j = (after + 1) % (int)pts.size();
+        imageToScreen(pts[after].x, pts[after].y, x0, y0);
+        imageToScreen(pts[j].x, pts[j].y, x1, y1);
+        return true;
+    }
+    if (after < 0 || after >= 4) return false;
+    imageToScreen(corner_x_[after], corner_y_[after], x0, y0);
+    imageToScreen(corner_x_[(after + 1) % 4], corner_y_[(after + 1) % 4], x1, y1);
+    return true;
+}
+
+bool ViewMageApp::barContains(float x, float y) const {
+    return next_rect_.contains(x, y) || export_rect_.contains(x, y) ||
+           jpg_rect_.contains(x, y) || denoise_rect_.contains(x, y) ||
+           enhance_rect_.contains(x, y) || scan_rect_.contains(x, y) ||
+           shape_rect_.contains(x, y);
+}
+
+void ViewMageApp::updatePlacement(float fx, float fy) {
+    float x0, y0, x1, y1;
+    if (!segmentScreen(place_after_, x0, y0, x1, y1)) return;
+    const OutlineAim a = aimOnSegment(fx, fy, x0, y0, x1, y1);
+    if (!a.ok) return;
+    place_ghost_sx_ = a.ghostX;
+    place_ghost_sy_ = a.ghostY;
+    finger_x_ = fx;
+    finger_y_ = fy;
+    float ix, iy;
+    screenToImage(a.ghostX, a.ghostY, ix, iy);
+    place_ix_ = std::clamp(ix, 0.0f, std::max(0.0f, (float)pixels_.w - 1.0f));
+    place_iy_ = std::clamp(iy, 0.0f, std::max(0.0f, (float)pixels_.h - 1.0f));
+}
+
+void ViewMageApp::insertOutlinePoint(int after, float ix, float iy,
+                                     PagePointKind kind, float hx, float hy) {
+    auto& pts = adjust_outline_.points;
+    if (after < 0 || after >= (int)pts.size()) return;
+    PagePoint knot;
+    knot.kind = kind;
+    knot.x = ix;
+    knot.y = iy;
+    knot.hx = kind == PagePointKind::Curve ? hx : 0.0f;
+    knot.hy = kind == PagePointKind::Curve ? hy : 0.0f;
+    pts.insert(pts.begin() + after + 1, knot);
+    syncShapeFromPoints();
+}
+
+void ViewMageApp::commitPlacement() {
+    if (!placing_) return;
+    ensureAdjustPoints();
+    // Always a straight point. Bending is the stick, which is a separate
+    // grab, so a finger that is not perfectly on the line does not invent a bow.
+    insertOutlinePoint(place_after_, place_ix_, place_iy_,
+                       PagePointKind::Fold, 0.0f, 0.0f);
+}
+
+bool ViewMageApp::pointRemoveArmed() const {
+    if (drag_handle_ || drag_corner_ < 0) return false;
+    const auto& pts = adjust_outline_.points;
+    if (drag_corner_ >= (int)pts.size() || pts.size() <= 3) return false;
+    if (pts[drag_corner_].kind == PagePointKind::Corner) return false;
+    const int n = (int)pts.size();
+    const int prev = (drag_corner_ + n - 1) % n;
+    const int next = (drag_corner_ + 1) % n;
+    float sx, sy;
+    imageToScreen(pts[drag_corner_].x, pts[drag_corner_].y, sx, sy);
+    auto nearScreen = [&](int i) {
+        if (pts[i].kind != PagePointKind::Corner) return false;
+        float kx, ky;
+        imageToScreen(pts[i].x, pts[i].y, kx, ky);
+        const float dx = sx - kx, dy = sy - ky;
+        return dx * dx + dy * dy < 80.0f * 80.0f;
+    };
+    if (nearScreen(prev) || nearScreen(next)) return true;
+    float x0, y0, x1, y1;
+    imageToScreen(pts[prev].x, pts[prev].y, x0, y0);
+    imageToScreen(pts[next].x, pts[next].y, x1, y1);
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len2 = dx * dx + dy * dy;
+    float dist;
+    if (len2 < 1.0f) {
+        dist = std::sqrt((sx - x0) * (sx - x0) + (sy - y0) * (sy - y0));
+    } else {
+        float t = ((sx - x0) * dx + (sy - y0) * dy) / len2;
+        t = std::clamp(t, 0.0f, 1.0f);
+        const float px = x0 + dx * t, py = y0 + dy * t;
+        dist = std::sqrt((sx - px) * (sx - px) + (sy - py) * (sy - py));
+    }
+    return dist > 72.0f;
+}
+
+int ViewMageApp::pointAt(float x, float y) const {
+    int best = -1;
+    float bestD = 56.0f * 56.0f;
+    for (int i = 0; i < (int)adjust_outline_.points.size(); ++i) {
+        float sx, sy;
+        imageToScreen(adjust_outline_.points[i].x, adjust_outline_.points[i].y, sx, sy);
+        const float dx = x - sx, dy = y - sy;
+        const float d = dx * dx + dy * dy;
+        if (d <= bestD) { bestD = d; best = i; }
+    }
+    if (!adjust_outline_.points.empty()) return best;
+    return cornerAt(x, y);
+}
+
+int ViewMageApp::handleAt(float x, float y) const {
+    int best = -1;
+    // Smaller than the stick, so the circle around the tip does not cover
+    // the point. The point and the tip still meet; nearerHandle splits them.
+    float bestD = 40.0f * 40.0f;
+    for (int i = 0; i < (int)adjust_outline_.points.size(); ++i) {
+        if (adjust_outline_.points[i].kind == PagePointKind::Corner) continue;
+        float hx, hy;
+        handleVector(i, hx, hy);
+        if (hx == 0.0f && hy == 0.0f) continue;
+        float sx, sy;
+        imageToScreen(adjust_outline_.points[i].x + hx,
+                      adjust_outline_.points[i].y + hy, sx, sy);
+        const float dx = x - sx, dy = y - sy;
+        const float d = dx * dx + dy * dy;
+        if (d <= bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
+bool ViewMageApp::segmentAt(float sx, float sy, int& after, float& ix, float& iy) const {
+    const auto& pts = adjust_outline_.points;
+    const bool have = !pts.empty();
+    const int n = have ? (int)pts.size() : 4;
+    if (n < 2) return false;
+    float best = kOutlineHitPx;
+    bool hit = false;
+    for (int i = 0; i < n; ++i) {
+        float x0, y0, x1, y1;
+        if (!segmentScreen(i, x0, y0, x1, y1)) continue;
+        const OutlineAim a = aimOnSegment(sx, sy, x0, y0, x1, y1);
+        if (!a.ok || a.fingerDist > best) continue;
+        bool onKnob = false;
+        const int knobs = have ? n : 4;
+        for (int k = 0; k < knobs; ++k) {
+            float kx, ky;
+            if (have) imageToScreen(pts[k].x, pts[k].y, kx, ky);
+            else      imageToScreen(corner_x_[k], corner_y_[k], kx, ky);
+            const float ox = sx - kx, oy = sy - ky;
+            if (ox * ox + oy * oy < 56.0f * 56.0f) onKnob = true;
+        }
+        if (onKnob) continue;
+        best = a.fingerDist;
+        hit = true;
+        after = i;
+        screenToImage(a.ghostX, a.ghostY, ix, iy);
+    }
+    return hit;
+}
+
+int ViewMageApp::cornerAt(float x, float y) const {
+    int best = -1;
+    float bestD = 56.0f * 56.0f;
+    for (int i = 0; i < 4; ++i) {
+        float sx, sy;
+        imageToScreen(corner_x_[i], corner_y_[i], sx, sy);
+        const float dx = x - sx, dy = y - sy;
+        const float d = dx * dx + dy * dy;
+        if (d <= bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
+void ViewMageApp::drawScanChrome(Canvas& canvas, float barTop) {
+    const Color edge{0.96f, 0.86f, 0.20f, 0.95f};
+    auto stroke = [&](float x0, float y0, float x1, float y1) {
+        const float dx = x1 - x0, dy = y1 - y0;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        if (len < 0.5f) return;
+        const float px = -dy / len * 1.5f, py = dx / len * 1.5f;
+        canvas.triangle(x0 + px, y0 + py, x0 - px, y0 - py, x1 + px, y1 + py, edge);
+        canvas.triangle(x0 - px, y0 - py, x1 + px, y1 + py, x1 - px, y1 - py, edge);
+    };
+    auto strokePoly = [&](const std::vector<float>& xs, const std::vector<float>& ys, bool close) {
+        const size_t n = std::min(xs.size(), ys.size());
+        if (n < 2) return;
+        float x0, y0, px, py;
+        imageToScreen(xs[0], ys[0], x0, y0);
+        px = x0; py = y0;
+        for (size_t i = 1; i < n; ++i) {
+            float x1, y1;
+            imageToScreen(xs[i], ys[i], x1, y1);
+            stroke(px, py, x1, y1);
+            px = x1; py = y1;
+        }
+        if (close) stroke(px, py, x0, y0);
+    };
+    const std::vector<PagePoint>& pts = adjust_outline_.points;
+    const Color cornerInk{0.96f, 0.86f, 0.20f, 1.0f};
+    const Color guideInk{0.25f, 0.72f, 0.95f, 1.0f};
+    const Color removeInk{0.86f, 0.16f, 0.12f, 1.0f};
+    const bool removing = pointRemoveArmed();
+    auto knob = [&](float cx, float cy, float fill, bool round, Color fillC) {
+        const float outer = fill + 4.0f;
+        canvas.rect(cx - outer, cy - outer, outer * 2.0f, outer * 2.0f,
+                    Color{0.0f, 0.0f, 0.0f, 1.0f}, round ? outer : 3.0f);
+        canvas.rect(cx - fill, cy - fill, fill * 2.0f, fill * 2.0f,
+                    fillC, round ? fill : 2.0f);
+    };
+    auto diamond = [&](float cx, float cy, float r, Color fillC) {
+        canvas.triangle(cx, cy - r, cx - r, cy, cx + r, cy, Color{0.0f, 0.0f, 0.0f, 1.0f});
+        canvas.triangle(cx, cy + r, cx - r, cy, cx + r, cy, Color{0.0f, 0.0f, 0.0f, 1.0f});
+        const float ir = r - 4.0f;
+        canvas.triangle(cx, cy - ir, cx - ir, cy, cx + ir, cy, fillC);
+        canvas.triangle(cx, cy + ir, cx - ir, cy, cx + ir, cy, fillC);
+    };
+    if (!pts.empty()) {
+        const int n = (int)pts.size();
+        for (int i = 0; i < n; ++i) {
+            const PagePoint& a = pts[i];
+            const PagePoint& b = pts[(i + 1) % n];
+            const bool curved = a.kind == PagePointKind::Curve || b.kind == PagePointKind::Curve;
+            const int steps = curved ? 12 : 1;
+            float x0, y0;
+            imageToScreen(a.x, a.y, x0, y0);
+            for (int k = 1; k <= steps; ++k) {
+                const float t = (float)k / (float)steps;
+                const float u = 1.0f - t;
+                const float hx0 = a.kind == PagePointKind::Curve ? a.hx : 0.0f;
+                const float hy0 = a.kind == PagePointKind::Curve ? a.hy : 0.0f;
+                const float hx1 = b.kind == PagePointKind::Curve ? -b.hx : 0.0f;
+                const float hy1 = b.kind == PagePointKind::Curve ? -b.hy : 0.0f;
+                const float ix = u*u*u*a.x + 3*u*u*t*(a.x+hx0) + 3*u*t*t*(b.x+hx1) + t*t*t*b.x;
+                const float iy = u*u*u*a.y + 3*u*u*t*(a.y+hy0) + 3*u*t*t*(b.y+hy1) + t*t*t*b.y;
+                float x1, y1;
+                imageToScreen(ix, iy, x1, y1);
+                stroke(x0, y0, x1, y1);
+                x0 = x1; y0 = y1;
+            }
+        }
+        // A tick at the middle of each side is the affordance: the line takes a dot.
+        for (int i = 0; i < n; ++i) {
+            float x0, y0, x1, y1;
+            imageToScreen(pts[i].x, pts[i].y, x0, y0);
+            imageToScreen(pts[(i + 1) % n].x, pts[(i + 1) % n].y, x1, y1);
+            const float dx = x1 - x0, dy = y1 - y0;
+            const float len = std::sqrt(dx * dx + dy * dy);
+            if (len < 96.0f) continue;
+            const float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
+            const float nx = -dy / len, ny = dx / len;
+            stroke(mx - nx * 8.0f, my - ny * 8.0f, mx + nx * 8.0f, my + ny * 8.0f);
+        }
+        for (int i = 0; i < n; ++i) {
+            float cx, cy;
+            imageToScreen(pts[i].x, pts[i].y, cx, cy);
+            const float fill = (i == drag_corner_ && !drag_handle_) ? 20.0f : 16.0f;
+            const bool pageCorner = pts[i].kind == PagePointKind::Corner;
+            const Color mark = (removing && i == drag_corner_) ? removeInk
+                             : pageCorner ? cornerInk : guideInk;
+            if (pts[i].kind == PagePointKind::Fold) diamond(cx, cy, fill + 4.0f, mark);
+            else knob(cx, cy, fill, pts[i].kind == PagePointKind::Curve, mark);
+            if (pts[i].kind == PagePointKind::Corner) continue;
+            float hx, hy;
+            handleVector(i, hx, hy);
+            if (hx == 0.0f && hy == 0.0f) continue;
+            float tx, ty;
+            imageToScreen(pts[i].x + hx, pts[i].y + hy, tx, ty);
+            stroke(cx, cy, tx, ty);
+            knob(tx, ty, 14.0f, true, guideInk);
+        }
+    } else if (adjust_shape_ != DocumentShape::Quad) {
+        if (adjust_shape_ == DocumentShape::Curve) {
+            strokePoly(adjust_outline_.ax, adjust_outline_.ay, false);
+            strokePoly(adjust_outline_.bx, adjust_outline_.by, false);
+            if (!adjust_outline_.ax.empty() && !adjust_outline_.bx.empty()) {
+                float x0, y0, x1, y1;
+                imageToScreen(adjust_outline_.ax.front(), adjust_outline_.ay.front(), x0, y0);
+                imageToScreen(adjust_outline_.bx.front(), adjust_outline_.by.front(), x1, y1);
+                stroke(x0, y0, x1, y1);
+                imageToScreen(adjust_outline_.ax.back(), adjust_outline_.ay.back(), x0, y0);
+                imageToScreen(adjust_outline_.bx.back(), adjust_outline_.by.back(), x1, y1);
+                stroke(x0, y0, x1, y1);
+            }
+        } else {
+            strokePoly(adjust_outline_.x, adjust_outline_.y, true);
+        }
+        return;
+    } else {
+        float sx[4], sy[4];
+        for (int i = 0; i < 4; ++i)
+            imageToScreen(corner_x_[i], corner_y_[i], sx[i], sy[i]);
+        for (int i = 0; i < 4; ++i)
+            stroke(sx[i], sy[i], sx[(i + 1) % 4], sy[(i + 1) % 4]);
+        for (int i = 0; i < 4; ++i) {
+            const float dx = sx[(i + 1) % 4] - sx[i];
+            const float dy = sy[(i + 1) % 4] - sy[i];
+            const float len = std::sqrt(dx * dx + dy * dy);
+            if (len < 96.0f) continue;
+            const float mx = (sx[i] + sx[(i + 1) % 4]) * 0.5f;
+            const float my = (sy[i] + sy[(i + 1) % 4]) * 0.5f;
+            const float nx = -dy / len, ny = dx / len;
+            stroke(mx - nx * 8.0f, my - ny * 8.0f, mx + nx * 8.0f, my + ny * 8.0f);
+        }
+        for (int i = 0; i < 4; ++i)
+            knob(sx[i], sy[i], (i == drag_corner_) ? 20.0f : 16.0f, false, cornerInk);
+    }
+
+    if (placing_) {
+        stroke(finger_x_, finger_y_, place_ghost_sx_, place_ghost_sy_);
+        diamond(place_ghost_sx_, place_ghost_sy_, 20.0f, guideInk);
+    }
+
+    const bool aiming = placing_ || drag_corner_ >= 0;
+    if (!aiming || pixels_.linear.empty()) return;
+    // Past about 4x fit the photograph is already the close view. A second
+    // zoom on top of it is how the page disappears.
+    const float fit = view_.fitScale();
+    if (!(fit > 0.0f) || view_.scale() > fit * 4.0f) return;
+
+    // 25 source pixels, 8 screen pixels each. The aim pixel is left clear:
+    // the cross stops short of it, so the centre of the window is the photo.
+    constexpr int kHalf = 12;
+    constexpr float kCell = 8.0f;
+    const float loupe = kCell * (float)(kHalf * 2 + 1);
+    const float gap = 96.0f;
+    const float margin = 8.0f;
+    const float screenW = (float)renderer_->width();
+    struct Cand { float x, y; };
+    const Cand cands[4] = {
+        {finger_x_ - loupe * 0.5f, finger_y_ - gap - loupe},
+        {finger_x_ - loupe * 0.5f, finger_y_ + gap},
+        {finger_x_ - gap - loupe, finger_y_ - loupe * 0.5f},
+        {finger_x_ + gap, finger_y_ - loupe * 0.5f},
+    };
+    auto clearOfFinger = [&](Cand c) {
+        const float nx = std::clamp(finger_x_, c.x, c.x + loupe);
+        const float ny = std::clamp(finger_y_, c.y, c.y + loupe);
+        const float dx = finger_x_ - nx, dy = finger_y_ - ny;
+        return dx * dx + dy * dy >= 64.0f * 64.0f;
+    };
+    auto fits = [&](Cand c) {
+        return c.x >= margin && c.y >= margin &&
+               c.x + loupe <= screenW - margin &&
+               c.y + loupe <= barTop - margin;
+    };
+    Cand place = cands[0];
+    bool placed = false;
+    for (Cand c : cands) {
+        if (fits(c) && clearOfFinger(c)) { place = c; placed = true; break; }
+    }
+    if (!placed) {
+        place.x = std::clamp(place.x, margin, std::max(margin, screenW - loupe - margin));
+        place.y = std::clamp(place.y, margin, std::max(margin, barTop - loupe - margin));
+    }
+
+    float loupeX = 0, loupeY = 0;
+    if (placing_) {
+        loupeX = place_ix_;
+        loupeY = place_iy_;
+    } else if (drag_corner_ >= 0 && drag_corner_ < (int)adjust_outline_.points.size()) {
+        loupeX = adjust_outline_.points[drag_corner_].x;
+        loupeY = adjust_outline_.points[drag_corner_].y;
+    } else if (drag_corner_ >= 0 && drag_corner_ < 4) {
+        loupeX = corner_x_[drag_corner_];
+        loupeY = corner_y_[drag_corner_];
+    }
+    const int pixX = (int)std::floor(loupeX);
+    const int pixY = (int)std::floor(loupeY);
+    const float gain = std::exp2(ev_);
+    const Color back{0.02f, 0.02f, 0.025f, 0.94f};
+    canvas.rect(place.x, place.y, loupe, loupe, back);
+
+    const auto clip = canvas.saveClip();
+    canvas.setClip(place.x, place.y, loupe, loupe);
+
+    for (int dy = -kHalf; dy <= kHalf; ++dy) {
+        for (int dx = -kHalf; dx <= kHalf; ++dx) {
+            const int ix = pixX + dx, iy = pixY + dy;
+            Color col{0.12f, 0.12f, 0.13f, 1.0f};
+            if (ix >= 0 && iy >= 0 && ix < (int)pixels_.w && iy < (int)pixels_.h) {
+                const float* p = pixels_.linear.data() +
+                    ((size_t)iy * pixels_.w + (size_t)ix) * 4;
+                col = Color{srgb_encode(std::clamp(p[0] * gain, 0.0f, 1.0f)),
+                            srgb_encode(std::clamp(p[1] * gain, 0.0f, 1.0f)),
+                            srgb_encode(std::clamp(p[2] * gain, 0.0f, 1.0f)), 1.0f};
+            }
+            const float cellCx = place.x + loupe * 0.5f +
+                                 ((float)ix + 0.5f - loupeX) * kCell;
+            const float cellCy = place.y + loupe * 0.5f +
+                                 ((float)iy + 0.5f - loupeY) * kCell;
+            canvas.rect(cellCx - kCell * 0.5f, cellCy - kCell * 0.5f, kCell, kCell, col);
+        }
+    }
+
+    auto toWin = [&](float ix, float iy, float& wx, float& wy) {
+        wx = place.x + loupe * 0.5f + (ix - loupeX) * kCell;
+        wy = place.y + loupe * 0.5f + (iy - loupeY) * kCell;
+    };
+    auto strokeWin = [&](float ax, float ay, float bx, float by) {
+        float x0, y0, x1, y1;
+        toWin(ax, ay, x0, y0);
+        toWin(bx, by, x1, y1);
+        stroke(x0, y0, x1, y1);
+    };
+    const std::vector<PagePoint>& wpts = adjust_outline_.points;
+    if (!wpts.empty()) {
+        const int n = (int)wpts.size();
+        for (int i = 0; i < n; ++i) {
+            const PagePoint& a = wpts[i];
+            const PagePoint& b = wpts[(i + 1) % n];
+            const bool curved = a.kind == PagePointKind::Curve || b.kind == PagePointKind::Curve;
+            const int steps = curved ? 8 : 1;
+            float px = a.x, py = a.y;
+            for (int k = 1; k <= steps; ++k) {
+                const float t = (float)k / (float)steps;
+                const float u = 1.0f - t;
+                const float hx0 = a.kind == PagePointKind::Curve ? a.hx : 0.0f;
+                const float hy0 = a.kind == PagePointKind::Curve ? a.hy : 0.0f;
+                const float hx1 = b.kind == PagePointKind::Curve ? -b.hx : 0.0f;
+                const float hy1 = b.kind == PagePointKind::Curve ? -b.hy : 0.0f;
+                const float ix = u*u*u*a.x + 3*u*u*t*(a.x+hx0) + 3*u*t*t*(b.x+hx1) + t*t*t*b.x;
+                const float iy = u*u*u*a.y + 3*u*u*t*(a.y+hy0) + 3*u*t*t*(b.y+hy1) + t*t*t*b.y;
+                strokeWin(px, py, ix, iy);
+                px = ix;
+                py = iy;
+            }
+        }
+    } else {
+        for (int i = 0; i < 4; ++i)
+            strokeWin(corner_x_[i], corner_y_[i],
+                      corner_x_[(i + 1) % 4], corner_y_[(i + 1) % 4]);
+    }
+    // Paint the aim pixel again, on top of the outline, then a cross that
+    // stops short of it. A line through the middle hides the very pixel
+    // being chosen, and a white hairline disappears on paper.
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int ix = pixX + dx, iy = pixY + dy;
+            Color col{0.12f, 0.12f, 0.13f, 1.0f};
+            if (ix >= 0 && iy >= 0 && ix < (int)pixels_.w && iy < (int)pixels_.h) {
+                const float* p = pixels_.linear.data() +
+                    ((size_t)iy * pixels_.w + (size_t)ix) * 4;
+                col = Color{srgb_encode(std::clamp(p[0] * gain, 0.0f, 1.0f)),
+                            srgb_encode(std::clamp(p[1] * gain, 0.0f, 1.0f)),
+                            srgb_encode(std::clamp(p[2] * gain, 0.0f, 1.0f)), 1.0f};
+            }
+            const float cellCx = place.x + loupe * 0.5f +
+                                 ((float)ix + 0.5f - loupeX) * kCell;
+            const float cellCy = place.y + loupe * 0.5f +
+                                 ((float)iy + 0.5f - loupeY) * kCell;
+            canvas.rect(cellCx - kCell * 0.5f, cellCy - kCell * 0.5f, kCell, kCell, col);
+        }
+    }
+    const float cx = place.x + loupe * 0.5f;
+    const float cy = place.y + loupe * 0.5f;
+    const float hole = 14.0f;
+    const Color crossDark{0.0f, 0.0f, 0.0f, 0.95f};
+    const Color crossLite{1.0f, 1.0f, 1.0f, 0.95f};
+    auto bar = [&](float x, float y, float w, float h, Color c) {
+        if (w > 0.5f && h > 0.5f) canvas.rect(x, y, w, h, c);
+    };
+    const float dark = 4.0f, lite = 2.0f;
+    bar(place.x, cy - dark * 0.5f, cx - hole - place.x, dark, crossDark);
+    bar(cx + hole, cy - dark * 0.5f, place.x + loupe - (cx + hole), dark, crossDark);
+    bar(cx - dark * 0.5f, place.y, dark, cy - hole - place.y, crossDark);
+    bar(cx - dark * 0.5f, cy + hole, dark, place.y + loupe - (cy + hole), crossDark);
+    bar(place.x, cy - lite * 0.5f, cx - hole - place.x, lite, crossLite);
+    bar(cx + hole, cy - lite * 0.5f, place.x + loupe - (cx + hole), lite, crossLite);
+    bar(cx - lite * 0.5f, place.y, lite, cy - hole - place.y, crossLite);
+    bar(cx - lite * 0.5f, cy + hole, lite, place.y + loupe - (cy + hole), crossLite);
+    canvas.restoreClip(clip);
+
+    const Color frame{1.0f, 1.0f, 1.0f, 0.85f};
+    canvas.rect(place.x, place.y, loupe, 2.0f, frame);
+    canvas.rect(place.x, place.y + loupe - 2.0f, loupe, 2.0f, frame);
+    canvas.rect(place.x, place.y, 2.0f, loupe, frame);
+    canvas.rect(place.x + loupe - 2.0f, place.y, 2.0f, loupe, frame);
 }
 
 void ViewMageApp::onHostResized() {
@@ -688,13 +1607,31 @@ void ViewMageApp::refreshHeadroom() {
 }
 
 void ViewMageApp::onSurfaceLost() {
-    // The handle belongs to a device that is going away. Drop it, keep the
-    // pixels: pixels_ is the expensive thing and it is still perfectly good.
-    texture_  = kInvalidTexture;
+    // The window is going away. The device is not: the pipelines and the
+    // uploaded photo stay valid, and onSurfaceRecreated() builds a swapchain
+    // for the window Android hands back. Nulling the texture handle here leaks
+    // that image and forces a second upload. During a denoise the ensemble
+    // buffers already fill memory, that upload fails, and the new surface
+    // stays black.
     surfaceOk_ = false;
 }
 
 bool ViewMageApp::onSurfaceRecreated() {
+    if (!renderer_) return false;
+
+    // New ANativeWindow, same device. Without a new swapchain, acquire returns
+    // SURFACE_LOST and every frame is skipped, so the window stays black while
+    // the denoise percentage was still advancing on the old one.
+    const bool keptDevice = renderer_->recreate_surface();
+    if (!keptDevice) {
+        VCE_LOGI("ViewMage", "surface incompatible with existing pipelines; rebuilding the renderer");
+        releaseTexture();
+        renderer_.reset();
+        renderer_ = std::make_unique<Renderer>(host_->surfaceProvider(), host_->assetReader(),
+                                               /*images=*/4, OutputTarget::Hdr10PQ);
+        hdr_ = renderer_->hdrActive();
+    }
+
     surfaceOk_ = true;
     refreshHeadroom();
     syncViewport();
@@ -726,8 +1663,59 @@ bool ViewMageApp::onSurfaceRecreated() {
         return false;
     };
 
+    if (pendingScan_.ok() && state_ == State::kReady) {
+        VCE_LOGI("ViewMage", "uploading scan result that landed off-screen");
+        DecodedImage previous = std::move(pixels_);
+        const TextureHandle old = texture_;
+        texture_ = kInvalidTexture;
+        pixels_ = std::move(pendingScan_);
+        if (uploadTexture()) {
+            if (old != kInvalidTexture) renderer_->destroy_texture(old);
+            keep_pixels_ = true;
+            view_.setImage((int)pixels_.w, (int)pixels_.h);
+            syncViewport();
+            view_.fit();
+            scanned_ = true;
+            enhanced_ = false;
+            ev_ = pixels_.autoEv;
+            white_ = pixels_.white;
+            dirty_ = true;
+            return true;
+        }
+        releaseTexture();
+        pixels_ = std::move(previous);
+        texture_ = old;
+    }
+
     if (uploadPending(pendingEnhanced_, "enhanced", &enhanced_)) return true;
     if (uploadPending(pendingDenoised_, "denoised", &denoised_)) return true;
+
+    // The photo is still on the GPU. A second upload, and a second develop,
+    // are what run out of memory while a denoise holds the ensemble buffers.
+    if (texture_ != kInvalidTexture) {
+        dirty_ = true;
+        return true;
+    }
+
+    // A denoise still running is already holding the ensemble buffers. A
+    // second develop here is what runs the process out of memory and leaves
+    // the recreated surface black. The photo is in pixels_; put it back.
+    if (refine_thread_.joinable() && !refined_ready_.load()) {
+        if (state_ == State::kReady && !pixels_.linear.empty() &&
+            !uploadTexture()) {
+            VCE_LOGE("ViewMage", "re-upload during denoise failed; "
+                     "the develop stays in memory");
+        }
+        dirty_ = true;
+        return true;
+    }
+
+    if (state_ == State::kReady && !pixels_.linear.empty()) {
+        if (!uploadTexture())
+            VCE_LOGE("ViewMage", "re-upload after surface recreate failed");
+        dirty_ = true;
+        return true;
+    }
 
     if (state_ == State::kReady) {
         const float savedEv = ev_;
@@ -755,7 +1743,45 @@ void ViewMageApp::onPointerDown(int pointerId, int x, int y) {
     forget(pointerId);   // a stale id, if an up was ever missed
     pointers_.push_back(Pointer{pointerId, (float)x, (float)y,
                                 (float)x, (float)y, nowSeconds()});
+    if (scan_adjust_ && pointers_.size() == 1 && state_ == State::kReady) {
+        const int handle = handleAt((float)x, (float)y);
+        const int knot = pointAt((float)x, (float)y);
+        bool useHandle = handle >= 0 && knot < 0;
+        if (handle >= 0 && knot >= 0) {
+            float kx, ky, hx, hy, tx, ty;
+            imageToScreen(adjust_outline_.points[knot].x,
+                          adjust_outline_.points[knot].y, kx, ky);
+            handleVector(handle, hx, hy);
+            imageToScreen(adjust_outline_.points[handle].x + hx,
+                          adjust_outline_.points[handle].y + hy, tx, ty);
+            useHandle = nearerHandle((float)x, (float)y, kx, ky, tx, ty);
+        }
+        const int hit = useHandle ? handle : knot;
+        if (hit >= 0) {
+            drag_corner_ = hit;
+            drag_handle_ = useHandle;
+            drag_pointer_ = pointerId;
+            finger_x_ = (float)x;
+            finger_y_ = (float)y;
+            dirty_ = true;
+        } else if (!barContains((float)x, (float)y)) {
+            int after = -1;
+            float ix = 0, iy = 0;
+            if (segmentAt((float)x, (float)y, after, ix, iy)) {
+                ensureAdjustPoints();
+                placing_ = true;
+                place_pointer_ = pointerId;
+                place_after_ = after;
+                updatePlacement((float)x, (float)y);
+                dirty_ = true;
+            }
+        }
+    }
     if (pointers_.size() == 2) {
+        drag_corner_ = -1;
+        drag_handle_ = false;
+        drag_pointer_ = -1;
+        placing_ = false;
         lastPinchDist_ = distance(pointers_[0].x, pointers_[0].y,
                                   pointers_[1].x, pointers_[1].y);
         lastMidX_ = (pointers_[0].x + pointers_[1].x) * 0.5f;
@@ -770,6 +1796,52 @@ void ViewMageApp::onPointerMove(int pointerId, int x, int y) {
     p->x = (float)x;
     p->y = (float)y;
     if (state_ != State::kReady) return;
+
+    if (placing_ && pointerId == place_pointer_ && pointers_.size() == 1) {
+        updatePlacement(p->x, p->y);
+        dirty_ = true;
+        return;
+    }
+
+    if (drag_corner_ >= 0 && pointerId == drag_pointer_ && pointers_.size() == 1) {
+        float ix, iy;
+        screenToImage(p->x, p->y, ix, iy);
+        ix = std::clamp(ix, 0.0f, std::max(0.0f, (float)pixels_.w - 1.0f));
+        iy = std::clamp(iy, 0.0f, std::max(0.0f, (float)pixels_.h - 1.0f));
+        if (drag_corner_ < (int)adjust_outline_.points.size()) {
+            PagePoint& pt = adjust_outline_.points[drag_corner_];
+            if (drag_handle_) {
+                float ksx, ksy;
+                imageToScreen(pt.x, pt.y, ksx, ksy);
+                // Screen distance, not source pixels: at fit, six source
+                // pixels is a couple of screen pixels and the stick can
+                // never be put back down.
+                if (distance(p->x, p->y, ksx, ksy) < kOutlineStraightenPx) {
+                    pt.kind = PagePointKind::Fold;
+                    pt.hx = pt.hy = 0.0f;
+                } else {
+                    pt.kind = PagePointKind::Curve;
+                    pt.hx = ix - pt.x;
+                    pt.hy = iy - pt.y;
+                }
+            } else {
+                pt.x = ix;
+                pt.y = iy;
+                if (adjust_outline_.points.size() == 4 && drag_corner_ < 4) {
+                    corner_x_[drag_corner_] = ix;
+                    corner_y_[drag_corner_] = iy;
+                }
+            }
+            syncShapeFromPoints();
+        } else if (drag_corner_ < 4) {
+            corner_x_[drag_corner_] = ix;
+            corner_y_[drag_corner_] = iy;
+        }
+        finger_x_ = p->x;
+        finger_y_ = p->y;
+        dirty_ = true;
+        return;
+    }
 
     if (pointers_.size() == 1) {
         view_.pan(p->x - px, p->y - py);
@@ -788,8 +1860,18 @@ void ViewMageApp::onPointerMove(int pointerId, int x, int y) {
         // fight a user trying to reframe while zooming, which is what people
         // actually do.
         view_.pan(midX - lastMidX_, midY - lastMidY_);
-        if (lastPinchDist_ > 1.0f && dist > 1.0f)
-            view_.zoomAbout(midX, midY, dist / lastPinchDist_);
+        if (lastPinchDist_ > 1.0f && dist > 1.0f) {
+            float ratio = dist / lastPinchDist_;
+            // Adjustment is for landing an edge, not for inspecting photosites.
+            // 32x fit stays available once the outline edit is over.
+            if (scan_adjust_) {
+                const float fit = view_.fitScale();
+                const float cap = fit * 6.0f;
+                if (cap > 0.0f && view_.scale() > 0.0f && view_.scale() * ratio > cap)
+                    ratio = cap / view_.scale();
+            }
+            view_.zoomAbout(midX, midY, ratio);
+        }
 
         lastPinchDist_ = dist;
         lastMidX_ = midX;
@@ -801,6 +1883,49 @@ void ViewMageApp::onPointerMove(int pointerId, int x, int y) {
 void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
     Pointer* p = find(pointerId);
     if (!p) return;
+
+    const bool wasPlacing = placing_ && pointerId == place_pointer_;
+    if (wasPlacing) {
+        commitPlacement();
+        placing_ = false;
+        dirty_ = true;
+    }
+
+    const bool wasDragging = drag_corner_ >= 0 && pointerId == drag_pointer_;
+    if (wasDragging) {
+        const bool stationary =
+            distance((float)x, (float)y, p->startX, p->startY) <= kTapSlopPx &&
+            (nowSeconds() - p->downTime) <= kTapMaxSeconds;
+        if (!drag_handle_ && drag_corner_ < (int)adjust_outline_.points.size()) {
+            const PagePointKind kind = adjust_outline_.points[drag_corner_].kind;
+            const bool removable = kind != PagePointKind::Corner &&
+                                   adjust_outline_.points.size() > 3;
+            if (removable && pointRemoveArmed()) {
+                adjust_outline_.points.erase(
+                    adjust_outline_.points.begin() + drag_corner_);
+                syncShapeFromPoints();
+                last_point_tap_ = -1;
+            } else if (removable && stationary) {
+                const double now = nowSeconds();
+                if (last_point_tap_ == drag_corner_ &&
+                    (now - last_point_tap_time_) <= kDoubleTapGap) {
+                    adjust_outline_.points.erase(
+                        adjust_outline_.points.begin() + drag_corner_);
+                    syncShapeFromPoints();
+                    last_point_tap_ = -1;
+                } else {
+                    last_point_tap_ = drag_corner_;
+                    last_point_tap_time_ = now;
+                }
+            } else if (!stationary) {
+                last_point_tap_ = -1;
+            }
+        }
+        drag_corner_ = -1;
+        drag_handle_ = false;
+        drag_pointer_ = -1;
+        dirty_ = true;
+    }
 
     const bool wasTap = distance((float)x, (float)y, p->startX, p->startY) <= kTapSlopPx &&
                         (nowSeconds() - p->downTime) <= kTapMaxSeconds &&
@@ -815,7 +1940,7 @@ void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
         lastMidY_ = pointers_[0].y;
     }
 
-    if (!wasTap || state_ != State::kReady) return;
+    if (wasDragging || wasPlacing || !wasTap || state_ != State::kReady) return;
 
     // ── Two coordinate spaces, and they are NOT the same one ────────────────
     //
@@ -845,7 +1970,10 @@ void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
     if (denoise_rect_.contains((float)x, (float)y)) {
         lastTapTime_ = -1.0;
         export_note_.clear();
-        startRefinement();
+        if (refine_thread_.joinable() && !refined_ready_.load())
+            refine_abort_.store(true);
+        else
+            startRefinement();
         dirty_ = true;
         return;
     }
@@ -854,6 +1982,30 @@ void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
         lastTapTime_ = -1.0;
         export_note_.clear();
         startEnhance();
+        dirty_ = true;
+        return;
+    }
+
+    if (scan_rect_.contains((float)x, (float)y)) {
+        lastTapTime_ = -1.0;
+        export_note_.clear();
+        startScan(true);
+        dirty_ = true;
+        return;
+    }
+
+    if (shape_rect_.contains((float)x, (float)y)) {
+        lastTapTime_ = -1.0;
+        export_note_.clear();
+        startScan(false);
+        dirty_ = true;
+        return;
+    }
+
+    if (next_rect_.contains((float)x, (float)y)) {
+        lastTapTime_ = -1.0;
+        export_note_.clear();
+        confirmScan();
         dirty_ = true;
         return;
     }
@@ -888,6 +2040,7 @@ void ViewMageApp::onPointerUp(int pointerId, int x, int y) {
 void ViewMageApp::draw() {
     curves_.clear();
     images_.clear();
+    frontShapes_.clear();
 
     const SafeInsets in = host_->safeInsets();
     const Font* fontPtr = font_.ftFace ? &font_ : nullptr;
@@ -917,10 +2070,28 @@ void ViewMageApp::draw() {
         // away from it. The cutout is glass over the picture, not a margin.
         canvas.imageFg(texture_, q.x, q.y, q.w, q.h);
         canvas.clearImageTone();   // the error text below is not an image
+    }
+
+    // Corners and the context window sit on the photograph. The POST bar is
+    // drawn afterwards so Next stays pressable when the window would cover it.
+    float barTopForLoupe = canvas.top() + canvas.h();
+    if (state_ == State::kReady && scan_adjust_) {
+        const float size = std::max(22.0f, canvas.w() * 0.028f);
+        const float barH = size * 2.4f;
+        const SafeInsets sys = host_->safeInsets();
+        const float navGuard = std::max((float)sys.bottom, canvas.h() * 0.05f);
+        barTopForLoupe = canvas.top() + canvas.h() - barH - navGuard;
+        // The photograph is a foreground image, composited after the curve
+        // overlay, so corner marks emitted as curves land underneath it.
+        // The shape list is drawn after that image.
+        canvas.useShapes(&frontShapes_);
+        drawScanChrome(canvas, barTopForLoupe);
+        canvas.useShapes(nullptr);
     } else if (state_ == State::kError) {
         const float size = std::max(28.0f, canvas.w() * 0.045f);
         canvas.textCentered(message_, canvas.left() + canvas.w() * 0.5f,
-                            canvas.top() + canvas.h() * 0.5f, size, kMessage);
+                            canvas.top() + canvas.h() * 0.5f - size * 0.65f,
+                            size, kMessage);
     }
 
     // ── The POST bar ────────────────────────────────────────────────────────
@@ -964,7 +2135,10 @@ void ViewMageApp::draw() {
             const float by = barY + (barH - size * 1.8f) * 0.5f;
             canvas.rect(bx, by, bw, size * 1.8f, live ? kButton : kButtonOff,
                         size * 0.4f);
-            canvas.textCentered(label, bx + bw * 0.5f, by + size * 1.25f, size,
+            // textCentered's y is the text TOP (the baseline is y + size), so
+            // the label sits at by + 0.25*size with its baseline at the button
+            // centre + cap-height/2 — not a full size lower than intended.
+            canvas.textCentered(label, bx + bw * 0.5f, by + size * 0.25f, size,
                                 live ? kMessage : kMessageOff);
             hit = live ? Rect{bx, by, bw, size * 1.8f} : Rect{0, 0, 0, 0};
             return bx;
@@ -972,7 +2146,8 @@ void ViewMageApp::draw() {
 
         const bool refining = refine_thread_.joinable() && !refined_ready_.load();
         const bool enhancing = enhance_thread_.joinable() && !enhanced_ready_.load();
-        const bool busy = refining || enhancing;
+        const bool scanning = scan_thread_.joinable() && !scan_ready_.load();
+        const bool busy = refining || enhancing || scanning;
         const float right = canvas.left() + canvas.w();
 
         // Save stays available on the plain develop — someone who does not want
@@ -987,7 +2162,12 @@ void ViewMageApp::draw() {
         // "Denoised" and there is nothing left to press.
         float cursorX = saveX;
         if (!model_bytes_.empty() && !denoised_) {
-            cursorX = button("Denoise", cursorX, !busy && !exporting_, denoise_rect_);
+            // Cancel is the way back. While the worker is in flight every
+            // other button is inert, so this one has to stay live.
+            if (refining)
+                cursorX = button("Cancel", cursorX, true, denoise_rect_);
+            else
+                cursorX = button("Denoise", cursorX, !busy && !exporting_, denoise_rect_);
         } else {
             denoise_rect_ = {0, 0, 0, 0};
         }
@@ -1001,8 +2181,25 @@ void ViewMageApp::draw() {
             enhance_rect_ = {0, 0, 0, 0};
         }
 
+        // Rect is a rectangular sheet: the four corners are the page, and
+        // Next pulls bends flat into that rectangle. Shape is any other
+        // outline, and the outside of it stays white. Next replaces both.
+        if (scan_adjust_) {
+            scan_rect_ = {0, 0, 0, 0};
+            shape_rect_ = {0, 0, 0, 0};
+            cursorX = button("Next", cursorX, !busy && !exporting_, next_rect_);
+        } else {
+            next_rect_ = {0, 0, 0, 0};
+            const bool canScan = !busy && !exporting_ && !pixels_.linear.empty();
+            cursorX = button("Rect", cursorX, canScan, scan_rect_);
+            cursorX = button("Shape", cursorX, canScan, shape_rect_);
+        }
+
         if (!busy && !exporting_) {
-            button("Save JPG", cursorX, true, jpg_rect_);
+            // cursorX MUST take this return: Save JPG extends further left
+            // than anything drawn so far, and the status zone below is cut at
+            // cursorX. Dropping it leaves the status parked ON this button.
+            cursorX = button("Save JPG", cursorX, true, jpg_rect_);
         } else {
             jpg_rect_ = {0, 0, 0, 0};
         }
@@ -1014,20 +2211,33 @@ void ViewMageApp::draw() {
             logged = true;
             VCE_LOGI("ViewMage", "Save at %.0f,%.0f %.0fx%.0f; JPG at "
                      "%.0f,%.0f %.0fx%.0f; Denoise at %.0f,%.0f %.0fx%.0f; "
-                     "Enhance at %.0f,%.0f %.0fx%.0f",
+                     "Enhance at %.0f,%.0f %.0fx%.0f; Rect at %.0f,%.0f %.0fx%.0f",
                      export_rect_.x, export_rect_.y, export_rect_.w,
                      export_rect_.h,
                      jpg_rect_.x, jpg_rect_.y, jpg_rect_.w, jpg_rect_.h,
                      denoise_rect_.x, denoise_rect_.y,
                      denoise_rect_.w, denoise_rect_.h,
                      enhance_rect_.x, enhance_rect_.y,
-                     enhance_rect_.w, enhance_rect_.h);
+                     enhance_rect_.w, enhance_rect_.h,
+                     scan_rect_.x, scan_rect_.y, scan_rect_.w, scan_rect_.h);
         }
 
-        canvas.textCentered(statusLine(), canvas.left() + canvas.w() * 0.32f,
-                            barY + barH * 0.5f + size * 0.35f, size, kMessage);
+        // Status: right-anchored to the button cluster's left edge and centred
+        // in the zone that leaves, so it can never paint over a button — with
+        // all five buttons up, the row spans most of the surface width. Long
+        // payloads (the export path) ellipsize instead of colliding.
+        const float statusRight = cursorX - pad;
+        const float statusW = std::max(
+            0.0f, std::min(canvas.w() * 0.32f, statusRight - canvas.left()));
+        if (statusW > 0.0f) {
+            const std::string status = truncateToWidth(
+                canvas, statusLine(), statusW, size, FontStyle::Roman);
+            canvas.textCentered(status, canvas.left() + statusW * 0.5f,
+                                barY + size * 0.55f, size, kMessage);
+        }
     }
 
     renderer_->draw(curves_, /*overlay_rotation_deg=*/0,
-                    /*images=*/{}, /*foregroundImages=*/images_);
+                    /*images=*/{}, /*foregroundImages=*/images_,
+                    /*msdfQuads=*/{}, /*shapeVerts=*/{}, frontShapes_);
 }

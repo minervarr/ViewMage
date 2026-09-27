@@ -30,3 +30,11 @@ struct EnhanceParams {
 // Safe to call from a worker thread.
 void enhanceImage(std::vector<float>& pixels, uint32_t w, uint32_t h,
                   const EnhanceParams& p, bool widePrimaries);
+
+// Finish a flattened page. Divides out slow shading, neutralises the paper and
+// puts it near diffuse white, keeps ink dark, and sharpens on luminance only.
+// Colour ratios of stamps and ruling survive; there is no vibrance pass.
+// `widePrimaries` picks the luma weights, same rule as enhanceImage.
+// Safe to call from a worker thread.
+void enhanceDocument(std::vector<float>& pixels, uint32_t w, uint32_t h,
+                     bool widePrimaries);

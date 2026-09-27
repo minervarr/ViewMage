@@ -11,6 +11,7 @@ add_library(viewmage_core STATIC
     src/ai_denoise.cc
     src/enhance.cc
     src/export_math.cc
+    src/document_scan.cc
 )
 
 target_include_directories(viewmage_core PUBLIC
@@ -50,6 +51,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_include_directories(view_transform_test PRIVATE include)
     if(NOT MSVC)
         target_compile_options(view_transform_test PRIVATE -Wall)
+    endif()
+
+    add_executable(outline_place_test
+        tests/outline_place_test.cc)
+    target_include_directories(outline_place_test PRIVATE include)
+    if(NOT MSVC)
+        target_compile_options(outline_place_test PRIVATE -Wall)
     endif()
 
     # dng_image_test: builds its own DNG fixture in memory. Needs

@@ -597,6 +597,13 @@ DecodedImage decode_dng(const uint8_t* data, size_t size, uint32_t maxDimension,
                  "demosaicing, by a neural network trained on real noisy/clean "
                  "raw pairs (RawNIND, Brummer & De Vleeschouwer). Colour and "
                  "white balance are still the camera's own.");
+        } else if (derr == "cancelled") {
+            // The caller already has a developed photo. Building a second
+            // Malvar image here only spends the memory the cancel was
+            // trying to give back.
+            ai_rgb.clear();
+            img.error = "cancelled";
+            return img;
         } else {
             ai_rgb.clear();
             note(img, DiagCode::kHighBitDepth, DiagLevel::kWarning,

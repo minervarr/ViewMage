@@ -22,6 +22,8 @@
 #include "core/dng_image.hh"
 #include "core/ai_denoise.hh"
 #include "core/enhance.hh"
+#include "core/document_scan.hh"
+#include "core/outline_place.hh"
 #include "png_export.hh"
 #include "core/view_transform.hh"
 
@@ -51,9 +53,9 @@ public:
     void shutdown() override;
     void onHostReady() override;
 
-    // The CPU keeps the decoded pixels so that coming back to the app
-    // re-uploads a texture instead of decoding again. That split — CPU state
-    // survives, GPU state does not — is invisible until the second visit.
+    // The window dies when the screen turns off and comes back as a new one.
+    // The device and the uploaded photo stay; onSurfaceRecreated rebuilds the
+    // swapchain. pixels_ is the fallback when that surface is incompatible.
     void onSurfaceLost() override;
     bool onSurfaceRecreated() override;
 
@@ -88,8 +90,13 @@ private:
     Rect        jpg_rect_{0, 0, 0, 0};
     Rect        denoise_rect_{0, 0, 0, 0};
     Rect        enhance_rect_{0, 0, 0, 0};
+    Rect        scan_rect_{0, 0, 0, 0};
+    Rect        shape_rect_{0, 0, 0, 0};
+    Rect        next_rect_{0, 0, 0, 0};
+    bool        scan_page_ = false;         // Rect rebuilds a rectangle; Shape does not
     bool        denoised_ = false;          // a refinement has landed
     bool        enhanced_ = false;          // an enhance has landed
+    bool        scanned_  = false;          // a page has been flattened
     bool        exporting_ = false;
     std::string export_note_;               // shown once a file has been written
 
@@ -101,6 +108,32 @@ private:
     void startEnhance();
     void pollEnhancement();
     void joinEnhancement();         // safe to call twice; called from shutdown
+
+    // Scan finds the outline and waits. A tap on a line adds a straight
+    // point. The point moves; the stick bends it, and the stick brought
+    // back onto the point straightens it. Next warps the page.
+    // The warp stays off the UI thread.
+    void startScan(bool rectangle);
+    void confirmScan();
+    void pollScan();
+    void joinScan();
+    void drawScanChrome(Canvas& canvas, float barTop);
+    int  cornerAt(float x, float y) const;
+    int  pointAt(float x, float y) const;
+    int  handleAt(float x, float y) const;
+    bool segmentAt(float sx, float sy, int& after, float& ix, float& iy) const;
+    bool segmentScreen(int after, float& x0, float& y0, float& x1, float& y1) const;
+    bool barContains(float x, float y) const;
+    void ensureAdjustPoints();
+    void updatePlacement(float fx, float fy);
+    void commitPlacement();
+    bool pointRemoveArmed() const;
+    void handleVector(int index, float& hx, float& hy) const;
+    void syncShapeFromPoints();
+    void insertOutlinePoint(int after, float ix, float iy,
+                            PagePointKind kind, float hx, float hy);
+    void screenToImage(float sx, float sy, float& ix, float& iy) const;
+    void imageToScreen(float ix, float iy, float& sx, float& sy) const;
     bool uploadTexture();           // pixels_ → GPU, degrading if it must
     void releaseTexture();
     // Drop the decoded pixels but keep everything we learned about them. At
@@ -158,6 +191,43 @@ private:
     EnhanceParams                enhance_params_;   // tuning knobs
     DecodedImage                 pendingEnhanced_;   // enhance result stored while surface is lost
 
+    std::thread                  scan_thread_;
+    std::mutex                   scan_mutex_;
+    DecodedImage                 scan_result_;      // guarded by scan_mutex_
+    std::atomic<bool>            scan_ready_{false};
+    std::atomic<bool>            scan_abort_{false};
+    std::string                  scan_error_;       // guarded by scan_mutex_
+    DocumentQuad                 scan_quad_{};      // guarded by scan_mutex_
+    DocumentOutline              scan_outline_{};   // guarded by scan_mutex_
+    bool                         scan_has_quad_ = false; // guarded by scan_mutex_
+    bool                         scan_flattening_ = false; // job the worker was given
+    DecodedImage                 pendingScan_;      // scan result while surface is lost
+
+    // Outline edit, in source pixels. Shown after detection until Next.
+    // Squares are corners, diamonds are fold points, circles are curve knots
+    // with a tangent handle.
+    bool  scan_adjust_ = false;
+    DocumentShape   adjust_shape_ = DocumentShape::Quad;
+    DocumentOutline adjust_outline_{};
+    float corner_x_[4] = {};
+    float corner_y_[4] = {};
+    int   drag_corner_ = -1;
+    int   drag_pointer_ = -1;
+    bool  drag_handle_ = false;
+    float finger_x_ = 0.0f;
+    float finger_y_ = 0.0f;
+    // A dot that does not exist yet. It is always a straight point. The stick
+    // on it is what bends it into a curve, afterwards.
+    bool  placing_ = false;
+    int   place_pointer_ = -1;
+    int   place_after_ = -1;
+    float place_ghost_sx_ = 0.0f;
+    float place_ghost_sy_ = 0.0f;
+    float place_ix_ = 0.0f;
+    float place_iy_ = 0.0f;
+    int    last_point_tap_ = -1;
+    double last_point_tap_time_ = -1.0;
+
     // The developed pixels are KEPT on the DNG path rather than freed after
     // upload. They are the largest allocation in the app, and they are also the
     // only thing "Save PNG" can write without spending another 26 seconds
@@ -185,6 +255,7 @@ private:
     std::string   message_;         // shown in kError
 
     std::vector<float>     curves_;
+    std::vector<float>     frontShapes_;   // corner marks, drawn above the photo
     std::vector<ImageDraw> images_;
 
     std::vector<Pointer> pointers_;
@@ -196,4 +267,5 @@ private:
     bool running_ = true;
     bool dirty_   = true;
     bool surfaceOk_ = true;
+    bool keepAwake_ = false;   // host flag; true while a long worker is in flight
 };

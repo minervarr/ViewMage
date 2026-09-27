@@ -67,6 +67,11 @@ tools/fetch_model.sh         # app/src/main/assets/models/model_bayer.onnx
 Without them the app still builds and runs; photos simply develop with the
 ordinary Malvar demosaic and no denoise.
 
+The rectangular document scan uses a second, much smaller network for the
+page corners: **DocAligner LC100** (DocsaidLab, Apache-2.0), a 4.6 MB heatmap
+model. `tools/fetch_page_model.sh` installs it. Without that file the scan
+keeps the luminance detector.
+
 ## Exporting
 
 The bottom bar's **Save PNG** writes what is on screen — developed, denoised,

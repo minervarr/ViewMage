@@ -412,6 +412,53 @@ re-launching an already-running activity with `am start`; a cold start
 (force-stop first) re-registers the region. Check that line before blaming
 coordinates.
 
+## Adding a point on the page outline
+
+Squares are the sheet's corners. A diamond is a sharp vertex you add (a fold).
+A circle is a bow, with one tangent handle. Detection places the squares. The
+finger adds the other two, and it does not do it by holding still.
+
+A 420ms hold on the segment was invisible: the status said "Drag a point",
+any twitch cancelled it, and the only thing it inserted was a circle under
+the contact. The diamond was a second secret (pull the handle back onto the
+knot). The loupe that opened was 13 source pixels at 18px cells, about 18×,
+with the centre cell missing, so the paper edge was a block of noise sitting
+under the finger.
+
+A tap on a line adds a **straight** point (a diamond). Each side draws a tick
+at its middle. The dot leads the finger by up to 64 screen pixels along the
+segment, so the edge stays visible beside the pad. A finger is never exactly
+on the line, so the kind is not decided by how far the contact sits off it —
+that made every new dot a curve. The stick on the diamond is the curve: it is 96 screen pixels long, so the
+tip sits clear of the point. Pressing the point moves it. Dragging the tip
+bends the side. Bringing the tip back within 64 screen pixels of the point
+straightens it. `aimOnSegment` only places the ghost.
+
+Removing a created point is also in screen pixels. Drag it off the side, or
+onto a neighbouring square, and release — the mark turns red and the status
+says so. A double-tap on a diamond or a circle removes it too. The old test
+was 28 source pixels from a corner, about ten screen pixels on a fitted 12 MP
+frame, which is why nothing would delete.
+
+The context window is 25 source pixels at 8 screen pixels each. The cross is
+black and white and stops short of the middle, and the aim pixels are painted
+again after the outline, so the centre is the photograph.
+
+The context window that follows a moving dot is about 45 source pixels across
+225 screen pixels, outline drawn on top, centre pixel painted. It is skipped
+once the photo is already past 4× fit. Pinch during adjustment caps at 6×
+fit; 32× remains for ordinary viewing. An existing square, diamond, or circle
+still moves from the contact — offsetting one of those would jump it on the
+first move.
+
+Rect keeps the four corner squares as the page. They land on the corners
+of the result, and each side runs straight from one corner to the next. A
+diamond or a circle edits only the side it sits on, and only as far into
+the page as that side bends. Shape is every other outline. There a diamond
+cuts or extends that side and the bite outside it is left blank, two
+diamonds unfold as a hinge, and a circle stays part of the boundary,
+including beside diamonds. The outside of a Shape outline is white.
+
 ## Enhance — finishing, deliberately thin
 
 `core/src/enhance.{hh,cc}`. Vibrance (muted colours boosted, saturated ones

@@ -17,6 +17,7 @@
 #include "core/dng_image.hh"
 #include "core/export_math.hh"
 #include "core/enhance.hh"
+#include "core/document_scan.hh"
 #include "core/ai_denoise.hh"
 
 #include "diagnose.hh"
@@ -100,7 +101,8 @@ void print_usage(const char* argv0) {
         "highlight rolloff, sRGB encode.\n"
         "\n"
         "Options:\n"
-        "  --enhance        Apply saturation/contrast/sharpen (like the Enhance button)\n"
+        "  --enhance        Photo vibrance/sharpen, or a document finish after --scan\n"
+        "  --scan           Rectangular page: drop the table and straighten its lines\n"
         "  --denoise[=PATH] Run neural raw denoise (model defaults to models/model_bayer.onnx)\n"
         "  --no-ensemble    Single-pass + detail layer: 4x faster, softer base,\n"
         "                   measured micro-detail returned (default is the x4 ensemble)\n"
@@ -118,6 +120,7 @@ void print_usage(const char* argv0) {
 
 int main(int argc, char** argv) {
     bool do_enhance = false;
+    bool do_scan = false;
     bool do_denoise = false;
     bool do_ensemble = true;
     bool do_stats   = false;
@@ -131,22 +134,25 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0) { print_usage(argv[0]); return 0; }
         else if (std::strcmp(argv[i], "--enhance") == 0) do_enhance = true;
+        else if (std::strcmp(argv[i], "--scan") == 0) do_scan = true;
         else if (std::strcmp(argv[i], "--no-ensemble") == 0) do_ensemble = false;
         else if (std::strcmp(argv[i], "--stats") == 0)   do_stats = true;
         else if (std::strcmp(argv[i], "--analyze") == 0) do_analyze = true;
-        else if (std::strcmp(argv[i], "--compare") == 0) do_compare = true;
-        // --compare swallows an optional crop: x y w h.
-        if (do_compare && i + 4 < argc) {
-            char* end1 = nullptr, *end2 = nullptr, *end3 = nullptr, *end4 = nullptr;
-            long v1 = strtol(argv[i+1], &end1, 10);
-            long v2 = strtol(argv[i+2], &end2, 10);
-            long v3 = strtol(argv[i+3], &end3, 10);
-            long v4 = strtol(argv[i+4], &end4, 10);
-            if (end1 && *end1 == '\0' && end2 && *end2 == '\0' &&
-                end3 && *end3 == '\0' && end4 && *end4 == '\0' &&
-                v1 >= 0 && v2 >= 0 && v3 >= 0 && v4 >= 0) {
-                cmp_x = int(v1); cmp_y = int(v2); cmp_w = int(v3); cmp_h = int(v4);
-                i += 4;
+        else if (std::strcmp(argv[i], "--compare") == 0) {
+            do_compare = true;
+            // Optional crop: x y w h, only when the next four args are numbers.
+            if (i + 4 < argc) {
+                char* end1 = nullptr, *end2 = nullptr, *end3 = nullptr, *end4 = nullptr;
+                long v1 = strtol(argv[i+1], &end1, 10);
+                long v2 = strtol(argv[i+2], &end2, 10);
+                long v3 = strtol(argv[i+3], &end3, 10);
+                long v4 = strtol(argv[i+4], &end4, 10);
+                if (end1 && *end1 == '\0' && end2 && *end2 == '\0' &&
+                    end3 && *end3 == '\0' && end4 && *end4 == '\0' &&
+                    v1 >= 0 && v2 >= 0 && v3 >= 0 && v4 >= 0) {
+                    cmp_x = int(v1); cmp_y = int(v2); cmp_w = int(v3); cmp_h = int(v4);
+                    i += 4;
+                }
             }
         }
         else if (std::strncmp(argv[i], "--denoise", 9) == 0) {
@@ -240,11 +246,90 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%ux%u, autoEV=%.2f, white=%.3f\n",
                  img.w, img.h, img.autoEv, img.white);
 
+    // ── Document scan (optional) ─────────────────────────────────────────────
+    if (do_scan) {
+        std::fprintf(stderr, "scanning for a page... ");
+        std::vector<uint8_t> pageModel;
+        if (FILE* mf = std::fopen("android/app/src/main/assets/models/page_quad.onnx", "rb")) {
+            std::fseek(mf, 0, SEEK_END);
+            const long msz = std::ftell(mf);
+            std::fseek(mf, 0, SEEK_SET);
+            if (msz > 0) {
+                pageModel.resize((size_t)msz);
+                if (std::fread(pageModel.data(), 1, pageModel.size(), mf) != pageModel.size())
+                    pageModel.clear();
+            }
+            std::fclose(mf);
+        }
+        float cornerPeak[4] = {};
+        const DocumentDetect det = detectRectangle(
+            img.linear.data(), img.w, img.h,
+            pageModel.empty() ? nullptr : pageModel.data(), pageModel.size(),
+            cornerPeak);
+        if (!pageModel.empty())
+            std::fprintf(stderr, "model peaks %.3f %.3f %.3f %.3f\n",
+                         cornerPeak[0], cornerPeak[1], cornerPeak[2], cornerPeak[3]);
+        if (!det.found) {
+            std::fprintf(stderr, "failed: %s\n",
+                         det.error.empty() ? "no document" : det.error.c_str());
+            return 2;
+        }
+        int nCorner = 0, nFold = 0, nCurve = 0;
+        for (const PagePoint& p : det.outline.points) {
+            if (p.kind == PagePointKind::Corner) ++nCorner;
+            else if (p.kind == PagePointKind::Fold) ++nFold;
+            else ++nCurve;
+        }
+        const char* shapeName = "quad";
+        if (det.outline.shape == DocumentShape::Triangle) shapeName = "triangle";
+        else if (det.outline.shape == DocumentShape::Fold) shapeName = "fold";
+        else if (det.outline.shape == DocumentShape::Curve) shapeName = "curve";
+        std::fprintf(stderr, "%s, %d corners, %d folds, %d curves\n",
+                     shapeName, nCorner, nFold, nCurve);
+        for (const PagePoint& p : det.outline.points) {
+            const char* k = p.kind == PagePointKind::Corner ? "corner"
+                          : p.kind == PagePointKind::Fold ? "fold" : "curve";
+            std::fprintf(stderr, "  %s %.0f,%.0f", k, p.x, p.y);
+            if (p.kind == PagePointKind::Curve)
+                std::fprintf(stderr, " handle %.0f,%.0f", p.hx, p.hy);
+            std::fprintf(stderr, "\n");
+        }
+        DocumentQuad page = det.quad;
+        int nRect = 0;
+        if (det.outline.shape != DocumentShape::Quad) {
+            for (const PagePoint& p : det.outline.points) {
+                if (p.kind != PagePointKind::Corner || nRect >= 4) continue;
+                page.x[nRect] = p.x;
+                page.y[nRect] = p.y;
+                ++nRect;
+            }
+            if (nRect != 4) {
+                std::fprintf(stderr, "failed: no rectangle\n");
+                return 2;
+            }
+        }
+        DocumentScan scan = reconstructRectangle(img.linear.data(), img.w, img.h, page);
+        if (!scan.found) {
+            std::fprintf(stderr, "failed: %s\n",
+                         scan.error.empty() ? "no document" : scan.error.c_str());
+            return 2;
+        }
+        img.linear = std::move(scan.linear);
+        img.w = scan.w;
+        img.h = scan.h;
+        img.autoEv = 0.0f;
+        img.white = 1.0f;
+        std::fprintf(stderr, "page %ux%u\n", img.w, img.h);
+    }
+
     // ── Enhance (optional) ───────────────────────────────────────────────────
     if (do_enhance) {
         std::fprintf(stderr, "enhancing... ");
-        enhanceImage(img.linear, img.w, img.h, EnhanceParams{},
-                     img.widePrimaries);
+        if (do_scan)
+            enhanceDocument(img.linear, img.w, img.h, img.widePrimaries);
+        else
+            enhanceImage(img.linear, img.w, img.h, EnhanceParams{},
+                         img.widePrimaries);
         std::fprintf(stderr, "done\n");
     }
 

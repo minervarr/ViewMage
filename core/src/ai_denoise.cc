@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 #include "log.hh"
 
@@ -240,6 +241,10 @@ bool RawDenoiser::run(const float* packed, int pw, int ph,
 
     const int passes = ensemble ? (int)(sizeof(kSyms) / sizeof(kSyms[0])) : 1;
     if (passes > 1) {
+      // The ensemble buffers die with this try. A retry of the single pass
+      // happens only after they are gone — calling it while acc/acc2 are
+      // still allocated is how a memory failure stays a memory failure.
+      try {
         // Accumulate in place: each pass produces a full-size image, so holding
         // all four at once would be four times the largest allocation here.
         // acc2 accumulates SQUARES alongside: the cross-pass variance is the
@@ -248,9 +253,9 @@ bool RawDenoiser::run(const float* packed, int pw, int ph,
         // trusted at fine scale.
         std::vector<float> acc, acc2, one, src;
         const size_t n = size_t(pw) * kAiScale * ph * kAiScale * 3;
-        try { acc.assign(n, 0.0f); acc2.assign(n, 0.0f);
-              src.resize(size_t(pw) * ph * 4); }
-        catch (const std::bad_alloc&) { err = "not enough memory to denoise"; return false; }
+        acc.assign(n, 0.0f);
+        acc2.assign(n, 0.0f);
+        src.resize(size_t(pw) * ph * 4);
 
         // Input channel means for gain matching (same for all passes).
         const size_t in_plane = size_t(pw) * ph;
@@ -319,8 +324,10 @@ bool RawDenoiser::run(const float* packed, int pw, int ph,
             auto sub = progress ? std::function<bool(float)>(
                 [&](float f) { return progress((p + f) / (float)passes); })
                                 : std::function<bool(float)>();
-            if (!run(src.data(), tw, th, one, err, sub, /*ensemble=*/false))
-                return false;
+            if (!run(src.data(), tw, th, one, err, sub, /*ensemble=*/false)) {
+                if (err == "cancelled") return false;
+                throw std::runtime_error(err.empty() ? "ensemble denoise failed" : err);
+            }
 
             // Undo the symmetry while accumulating. For 180° and anti-transpose
             // the input planes were REVERSED ({3,2,1,0} / {3,1,2,0}), so the
@@ -473,17 +480,21 @@ bool RawDenoiser::run(const float* packed, int pw, int ph,
                  passes, gain[0], gain[1], gain[2]);
         out = std::move(acc);
         return true;
+      } catch (const std::bad_alloc&) {
+        err = "not enough memory for the ensemble";
+      } catch (const std::exception& e) {
+        err = e.what();
+      }
+      VCE_LOGI("ViewMage", "ensemble denoise failed (%s); retrying one pass",
+               err.c_str());
+      return run(packed, pw, ph, out, err, progress, /*ensemble=*/false);
     }
 
+    try {
     const int ow = pw * kAiScale, oh = ph * kAiScale;
     const size_t in_plane = size_t(pw) * ph;
 
-    try {
-        out.assign(size_t(ow) * oh * 3, 0.0f);
-    } catch (const std::bad_alloc&) {
-        err = "not enough memory to denoise this photo";
-        return false;
-    }
+    out.assign(size_t(ow) * oh * 3, 0.0f);
 
     const int nx = (pw + kAiStep - 1) / kAiStep;
     const int ny = (ph + kAiStep - 1) / kAiStep;
@@ -663,6 +674,13 @@ bool RawDenoiser::run(const float* packed, int pw, int ph,
     VCE_LOGI("ViewMage", "gain match per channel (trimmed mean): R %.3e G %.3e B %.3e",
              gain[0], gain[1], gain[2]);
     return true;
+    } catch (const std::bad_alloc&) {
+        err = "not enough memory to denoise this photo";
+        return false;
+    } catch (const Ort::Exception& e) {
+        err = std::string("denoiser failed: ") + e.what();
+        return false;
+    }
 }
 
 #endif  // VIEWMAGE_WITH_ORT

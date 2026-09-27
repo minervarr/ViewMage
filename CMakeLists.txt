@@ -104,7 +104,8 @@ vce_compile_slang(compile_font_shaders ${SHADER_OUT}
     composite_vert composite_frag tiling coverage)
 vce_compile_slang(compile_canvas_shaders ${SHADER_OUT}
     ${VK_CANVAS_DIR}/shaders_src
-    overlay_vert overlay_frag image_vert image_frag)
+    overlay_vert overlay_frag image_vert image_frag
+    shape_vert shape_frag)
 
 # ── Core library ─────────────────────────────────────────────────────────────
 add_subdirectory(${CMAKE_SOURCE_DIR}/core ${CMAKE_BINARY_DIR}/core)

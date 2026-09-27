@@ -110,6 +110,12 @@ def stageViewMageAssets = tasks.register('stageViewMageAssets', Copy) {
         into 'fonts/newcomputermodern'
     }
 }
-tasks.matching { it.name ==~ /merge.*Assets/ }.configureEach {
+// merge*Assets consumes the staged dir as an asset source. Release lint does
+// too (generateReleaseLintVitalReportModel), and Gradle 9 refuses that unless
+// the consumer declares the producer. Debug never runs that lint task, which
+// is why assembleDebug succeeded and assembleRelease did not.
+tasks.matching {
+    it.name ==~ /merge.*Assets/ || it.name.toLowerCase().contains('lint')
+}.configureEach {
     dependsOn stageViewMageAssets
 }

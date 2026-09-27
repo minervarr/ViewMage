@@ -59,9 +59,33 @@ set(_saved_c_debug   "${CMAKE_C_FLAGS_DEBUG}")
 set(_saved_cxx_debug "${CMAKE_CXX_FLAGS_DEBUG}")
 set(CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG} -O2")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2")
+# libjxl applies "-Xclang -mrelax-all" globally as an x86-era workaround
+# (thirdparty/libjxl/CMakeLists.txt, untouchable). On Thumb-2 that makes
+# clang's MC reject two otherwise-fine fixups at COMPILE time, both
+# "out of range pc-relative fixup value" on armeabi-v7a only:
+#   1) stack-canary guard loads (-fstack-protector-strong, from the NDK
+#      toolchain flags) — a pc-relative access MC cannot relax, and
+#   2) switch jump tables lowered under -O2 -fPIC — Thumb TBB/TBH offsets.
+# Both are cancelled here for the 32-bit ABI: directory options are emitted
+# after CMAKE_CXX_FLAGS (where the NDK's ssp flag lives), so the -fno-* win.
+# arm64/x86 are unaffected and keep their default codegen.
+if(ANDROID_ABI STREQUAL "armeabi-v7a")
+    add_compile_options(-fno-stack-protector -fno-jump-tables)
+endif()
 add_subdirectory(${LIBJXL_DIR} ${CMAKE_BINARY_DIR}/libjxl EXCLUDE_FROM_ALL)
 set(CMAKE_C_FLAGS_DEBUG   "${_saved_c_debug}")
 set(CMAKE_CXX_FLAGS_DEBUG "${_saved_cxx_debug}")
+
+# One more -mrelax-all casualty: lib/jxl/splines.cc cannot be lowered at -O2
+# even with jump tables disabled (its remaining table-branch construct only
+# fits at -O1) — "out of range pc-relative fixup value" again. Drop the
+# decoder to -O1 on the 32-bit ABI; decode perf there is secondary and the
+# alternative is an assembler error. jxl_cms keeps -O2.
+if(ANDROID_ABI STREQUAL "armeabi-v7a")
+    target_compile_options(jxl_dec-obj PRIVATE -O1)
+endif()
+
+# ── Core library (portable) ─────────────────────────────────────────────────
 
 # ── ONNX Runtime (prebuilt import) ──────────────────────────────────────────
 set(ORT_DIR ${REPO_ROOT}/thirdparty/onnxruntime)
@@ -84,13 +108,14 @@ add_subdirectory(${REPO_ROOT}/core ${CMAKE_BINARY_DIR}/core)
 
 # ── Shaders ──────────────────────────────────────────────────────────────────
 include(${VK_CANVAS_DIR}/cmake/VceShaders.cmake)
-set(SHADER_OUT ${REPO_ROOT}/app/src/main/assets/shaders)
+set(SHADER_OUT ${REPO_ROOT}/android/app/src/main/assets/shaders)
 vce_compile_slang(compile_font_shaders ${SHADER_OUT}
     ${VK_CANVAS_DIR}/first_party/vulkan_font_engine/shaders_src
     composite_vert composite_frag tiling coverage)
 vce_compile_slang(compile_canvas_shaders ${SHADER_OUT}
     ${VK_CANVAS_DIR}/shaders_src
-    overlay_vert overlay_frag image_vert image_frag)
+    overlay_vert overlay_frag image_vert image_frag
+    shape_vert shape_frag)
 
 # ── ui_min_text_size.gen.h (placeholder — ViewMage uses no fonts) ────────────
 set(_gen_dir ${CMAKE_BINARY_DIR}/generated)

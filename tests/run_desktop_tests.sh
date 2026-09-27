@@ -18,6 +18,12 @@ g++ -std=c++17 -O1 -Wall -o "$OUT/view_transform_test" \
     -I ../core/include
 "$OUT/view_transform_test"
 
+echo "== outline_place_test =="
+g++ -std=c++17 -O1 -Wall -o "$OUT/outline_place_test" \
+    ../core/tests/outline_place_test.cc \
+    -I ../core/include
+"$OUT/outline_place_test"
+
 # The tone curve lives in vk_canvas, and so does its test — but vk_canvas only
 # builds its tests from the WINDOWS build, so on a Linux dev machine nothing
 # ever ran it. A test nobody runs is a test that rots, and this one guards the
@@ -44,6 +50,25 @@ g++ -std=c++17 -O1 -Wall -o "$OUT/dng_image_test" \
     ../core/tests/dng_image_test.cc ../core/src/dng_image.cc ../core/src/decoded_image.cc ../core/src/ai_denoise.cc \
     -I ../core/src -I ../core/include -I ../framework/vk_canvas/core
 "$OUT/dng_image_test" ${1:+"$1"}
+
+echo "== document_scan_test =="
+ORT=../thirdparty/onnxruntime
+PAGE=../android/app/src/main/assets/models/page_quad.onnx
+if [ -f "$ORT/lib/x86_64/libonnxruntime.so" ] && [ -f "$PAGE" ]; then
+    g++ -std=c++17 -O1 -Wall -DVIEWMAGE_WITH_ORT -o "$OUT/document_scan_test" \
+        ../core/tests/document_scan_test.cc ../core/src/document_scan.cc \
+        ../core/src/enhance.cc \
+        -I ../core/include -I "$ORT/include" \
+        -L "$ORT/lib/x86_64" -lonnxruntime \
+        -Wl,-rpath,"$ORT/lib/x86_64"
+else
+    echo "(page model or ONNX Runtime absent — luminance detector only)"
+    g++ -std=c++17 -O1 -Wall -o "$OUT/document_scan_test" \
+        ../core/tests/document_scan_test.cc ../core/src/document_scan.cc \
+        ../core/src/enhance.cc \
+        -I ../core/include
+fi
+"$OUT/document_scan_test"
 
 echo "== jxl_image_test =="
 if ! pkg-config --exists libjxl libjxl_threads libjxl_cms; then
