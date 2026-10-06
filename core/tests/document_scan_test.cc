@@ -1028,9 +1028,9 @@ int main() {
         return lines ? worst : 1e9f;
     };
 
-    // A rectangular sheet with rulings that bow over one mountain. The wood
-    // outside the quad is red and must not enter the page. The bowed rulings
-    // come out level; a homography leaves the bow.
+    // A rectangular sheet with rulings that bow. Wood outside the quad stays
+    // out. The bow is ink on a flat quad, so the page is the homography and
+    // the rulings keep their curve.
     {
         const uint32_t BW = 320, BH = 240;
         DocumentQuad q;
@@ -1069,7 +1069,16 @@ int main() {
         std::fprintf(stderr, "mountain homography span %.2f rebuilt span %.2f\n",
                      homoDev, pageDev);
         CHECK(homoDev >= 8.0f);
-        CHECK(pageDev < 3.0f);
+        CHECK(pageDev >= 8.0f);
+        float diff = 1e9f;
+        if (homo.w == rebuilt.w && homo.h == rebuilt.h) {
+            diff = 0;
+            for (size_t i = 0; i < (size_t)homo.w * homo.h; ++i)
+                diff = std::max(diff, std::fabs(homo.linear[i * 4 + 1] -
+                                                rebuilt.linear[i * 4 + 1]));
+        }
+        std::fprintf(stderr, "mountain rebuild vs homography %.5f\n", diff);
+        CHECK(diff < 1e-4f);
         int red = 0;
         if (rebuilt.found) {
             for (size_t i = 0; i < (size_t)rebuilt.w * rebuilt.h; ++i) {
@@ -1082,8 +1091,8 @@ int main() {
         CHECK(red < (int)(rebuilt.w * rebuilt.h) / 200);
     }
 
-    // A brightness step with straight rulings is not a fold. The rebuild
-    // stays on the homography.
+    // A brightness step with straight rulings is not a kink in the page.
+    // The rules stay on the homography. The dark face is lifted.
     {
         const uint32_t SW = 300, SH = 200;
         DocumentQuad q;
@@ -1108,15 +1117,28 @@ int main() {
         const DocumentScan homo = flattenDocument(shade.data(), SW, SH, q);
         const DocumentScan rebuilt = reconstructRectangle(shade.data(), SW, SH, q);
         CHECK(homo.found && rebuilt.found);
-        float diff = 1e9f;
-        if (homo.found && rebuilt.found && homo.w == rebuilt.w && homo.h == rebuilt.h) {
-            diff = 0;
-            for (size_t i = 0; i < (size_t)homo.w * homo.h; ++i)
-                diff = std::max(diff, std::fabs(homo.linear[i * 4 + 1] -
-                                                rebuilt.linear[i * 4 + 1]));
-        }
-        std::fprintf(stderr, "shade step vs homography %.5f\n", diff);
-        CHECK(diff < 1e-4f);
+        const float pageDev = lineDev(rebuilt);
+        auto face = [](const DocumentScan& s, bool left) {
+            if (!s.found) return 0.0;
+            double acc = 0;
+            int n = 0;
+            const uint32_t x0 = left ? s.w / 8 : s.w / 2;
+            const uint32_t x1 = left ? s.w / 2 : s.w * 7 / 8;
+            for (uint32_t y = s.h / 5; y < s.h * 4 / 5; ++y)
+                for (uint32_t x = x0; x < x1; ++x) {
+                    const float g = s.linear[((size_t)y * s.w + x) * 4 + 1];
+                    if (g < 0.2f) continue;
+                    acc += g;
+                    ++n;
+                }
+            return n ? acc / n : 0.0;
+        };
+        const double homoGap = std::fabs(face(homo, true) - face(homo, false));
+        const double pageGap = std::fabs(face(rebuilt, true) - face(rebuilt, false));
+        std::fprintf(stderr, "shade rule span %.2f face gap %.3f -> %.3f\n",
+                     pageDev, homoGap, pageGap);
+        CHECK(pageDev < 3.0f);
+        CHECK(pageGap < homoGap * 0.55);
     }
 
     auto stamp = [](std::vector<float>& img, uint32_t W, uint32_t H,

@@ -57,7 +57,7 @@ PAGE=../android/app/src/main/assets/models/page_quad.onnx
 if [ -f "$ORT/lib/x86_64/libonnxruntime.so" ] && [ -f "$PAGE" ]; then
     g++ -std=c++17 -O1 -Wall -DVIEWMAGE_WITH_ORT -o "$OUT/document_scan_test" \
         ../core/tests/document_scan_test.cc ../core/src/document_scan.cc \
-        ../core/src/enhance.cc \
+        ../core/src/page_quad.cc ../core/src/enhance.cc \
         -I ../core/include -I "$ORT/include" \
         -L "$ORT/lib/x86_64" -lonnxruntime \
         -Wl,-rpath,"$ORT/lib/x86_64"
@@ -65,10 +65,16 @@ else
     echo "(page model or ONNX Runtime absent — luminance detector only)"
     g++ -std=c++17 -O1 -Wall -o "$OUT/document_scan_test" \
         ../core/tests/document_scan_test.cc ../core/src/document_scan.cc \
-        ../core/src/enhance.cc \
+        ../core/src/page_quad.cc ../core/src/enhance.cc \
         -I ../core/include
 fi
 "$OUT/document_scan_test"
+
+echo "== page_quad_test =="
+g++ -std=c++17 -O1 -Wall -o "$OUT/page_quad_test" \
+    ../core/tests/page_quad_test.cc ../core/src/page_quad.cc \
+    -I ../core/include
+"$OUT/page_quad_test"
 
 echo "== jxl_image_test =="
 if ! pkg-config --exists libjxl libjxl_threads libjxl_cms; then

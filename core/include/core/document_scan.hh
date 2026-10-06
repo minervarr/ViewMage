@@ -89,8 +89,8 @@ struct DocumentScan {
 // bow. scanDocument does both, for the command-line path.
 //
 // reconstructRectangle is the rectangular sheet. The quad keeps the table
-// out. Printed rulings that bend over a fold are straightened; a sheet whose
-// rulings are already straight stays the homography.
+// out and the page is one homography, so a straight line stays straight.
+// A diamond or a circle on a side bends only that side.
 //
 // The outline overload keeps the four corner points as that same rectangle.
 // Corners land on the corners, and each side runs straight from one corner

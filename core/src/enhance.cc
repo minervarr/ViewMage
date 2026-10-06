@@ -183,6 +183,39 @@ float sampleBilinearGray(const std::vector<float>& img, int w, int h, float x, f
     return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
 }
 
+// p90/p10 of the blurred page light. Below about 1.55 the page is one face.
+float pageShadeRatio(const std::vector<float>& pixels, uint32_t w, uint32_t h,
+                     float wr, float wg, float wb) {
+    const int longSide = (int)std::max(w, h);
+    const int dsLong = std::min(160, longSide);
+    const float dsScale = (float)longSide / (float)dsLong;
+    const int dw = std::max(8, (int)std::lround((float)w / dsScale));
+    const int dh = std::max(8, (int)std::lround((float)h / dsScale));
+    std::vector<float> small((size_t)dw * dh, 0.0f);
+    for (int y = 0; y < dh; ++y) {
+        const int y0 = std::min((int)((float)y * h / dh), (int)h - 1);
+        const int y1 = std::min((int)((float)(y + 1) * h / dh), (int)h);
+        for (int x = 0; x < dw; ++x) {
+            const int x0 = std::min((int)((float)x * w / dw), (int)w - 1);
+            const int x1 = std::min((int)((float)(x + 1) * w / dw), (int)w);
+            double acc = 0;
+            int cnt = 0;
+            for (int py = y0; py < y1; ++py) {
+                for (int px = x0; px < x1; ++px) {
+                    const float* p = &pixels[((size_t)py * w + px) * 4];
+                    acc += wr * p[0] + wg * p[1] + wb * p[2];
+                    ++cnt;
+                }
+            }
+            small[(size_t)y * dw + x] = cnt ? (float)(acc / cnt) : 0.0f;
+        }
+    }
+    const int blurR = std::max(1, (int)std::lround(0.08f * (float)dsLong));
+    std::vector<float> blurred;
+    boxBlurLuma(small, blurred, dw, dh, blurR);
+    return percentileAt(blurred, 0.90) / std::max(percentileAt(blurred, 0.10), 1e-4f);
+}
+
 }  // namespace
 
 void enhanceDocument(std::vector<float>& pixels, uint32_t w, uint32_t h,
@@ -317,4 +350,56 @@ void enhanceDocument(std::vector<float>& pixels, uint32_t w, uint32_t h,
 
     const int radius = std::clamp((int)(std::min(w, h) / 900), 1, 3);
     sharpen(pixels, w, h, 0.75f, radius, luma_w);
+}
+
+void evenShadedPage(std::vector<float>& pixels, uint32_t w, uint32_t h,
+                    bool widePrimaries) {
+    if (w < 2 || h < 2 || pixels.size() < (size_t)w * h * 4) return;
+    const float* luma_w = widePrimaries ? export_math::kLumaBt2020
+                                        : export_math::kLumaBt709;
+    const float wr = luma_w[0], wg = luma_w[1], wb = luma_w[2];
+    if (pageShadeRatio(pixels, w, h, wr, wg, wb) < 1.55f) return;
+
+    const int longSide = (int)std::max(w, h);
+    const int dsLong = std::min(160, longSide);
+    const float dsScale = (float)longSide / (float)dsLong;
+    const int dw = std::max(8, (int)std::lround((float)w / dsScale));
+    const int dh = std::max(8, (int)std::lround((float)h / dsScale));
+    std::vector<float> small((size_t)dw * dh, 0.0f);
+    auto lumaAt = [&](const float* p) { return wr * p[0] + wg * p[1] + wb * p[2]; };
+    for (int y = 0; y < dh; ++y) {
+        const int y0 = std::min((int)((float)y * h / dh), (int)h - 1);
+        const int y1 = std::min((int)((float)(y + 1) * h / dh), (int)h);
+        for (int x = 0; x < dw; ++x) {
+            const int x0 = std::min((int)((float)x * w / dw), (int)w - 1);
+            const int x1 = std::min((int)((float)(x + 1) * w / dw), (int)w);
+            double acc = 0;
+            int cnt = 0;
+            for (int py = y0; py < y1; ++py)
+                for (int px = x0; px < x1; ++px) {
+                    acc += lumaAt(&pixels[((size_t)py * w + px) * 4]);
+                    ++cnt;
+                }
+            small[(size_t)y * dw + x] = cnt ? (float)(acc / cnt) : 0.0f;
+        }
+    }
+    const int blurR = std::max(2, (int)std::lround(0.12f * (float)dsLong));
+    std::vector<float> blurred;
+    boxBlurLuma(small, blurred, dw, dh, blurR);
+    std::vector<float> lit;
+    lit.reserve(blurred.size());
+    for (float v : blurred)
+        if (v > 0.02f) lit.push_back(v);
+    const float target = std::max(percentileAt(lit, 0.90), 1e-3f);
+    for (uint32_t y = 0; y < h; ++y) {
+        const float fy = ((float)y + 0.5f) * (float)dh / (float)h - 0.5f;
+        for (uint32_t x = 0; x < w; ++x) {
+            const float fx = ((float)x + 0.5f) * (float)dw / (float)w - 0.5f;
+            const float b = sampleBilinearGray(blurred, dw, dh, fx, fy);
+            const float div = std::max(b, 0.22f * target);
+            const float g = std::min(target / div, 4.0f);
+            float* p = &pixels[((size_t)y * w + x) * 4];
+            p[0] *= g; p[1] *= g; p[2] *= g;
+        }
+    }
 }

@@ -19,6 +19,9 @@ firstparty/
 # The wrapper binary itself is a local tool, not project source.
 git_wrapper
 
+# Headless capture dumped at the repo root.
+/--scan
+
 # Editor / tooling
 compile_commands.json
 .idea/

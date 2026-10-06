@@ -38,3 +38,11 @@ void enhanceImage(std::vector<float>& pixels, uint32_t w, uint32_t h,
 // Safe to call from a worker thread.
 void enhanceDocument(std::vector<float>& pixels, uint32_t w, uint32_t h,
                      bool widePrimaries);
+
+// The same shading divide, paper white balance and black/white place, without
+// sharpening. A page whose light is already even is left untouched, so a flat
+// sheet and a coloured card stay as the homography wrote them. A creased sheet
+// whose two faces differ gets the shadow lifted. The gain is smooth, so a
+// straight rule stays straight.
+void evenShadedPage(std::vector<float>& pixels, uint32_t w, uint32_t h,
+                    bool widePrimaries);

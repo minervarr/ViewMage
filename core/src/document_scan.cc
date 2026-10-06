@@ -3,6 +3,8 @@
 // Copyright (C) 2026 nava. AGPLv3 or later; see LICENSE.
 
 #include "core/document_scan.hh"
+#include "core/enhance.hh"
+#include "core/page_quad.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -1221,6 +1223,198 @@ bool refinePageCorners(const float* linear, uint32_t w, uint32_t h, Pt q[4]) {
     return true;
 }
 
+// The corner model often frames the sheet with a band of table still inside,
+// or lands on the printed border and drops the margin past it. A side moves
+// to where the sheet's own colour gives way to the table. Ink is dark, so
+// the vote uses the bright part of a small patch: a rule or a line of text
+// still counts as the sheet, and the words in the margin stay inside.
+// Grey paper on grey wood shares whiteness, and that side is left alone.
+void tightenPaperMargins(const float* linear, uint32_t w, uint32_t h, Pt q[4]) {
+    float cx = 0, cy = 0;
+    for (int i = 0; i < 4; ++i) { cx += q[i].x; cy += q[i].y; }
+    cx *= 0.25f; cy *= 0.25f;
+    auto bilerp = [&](float u, float v) {
+        const float a = (1.0f - u) * (1.0f - v);
+        const float b = u * (1.0f - v);
+        const float c = u * v;
+        const float d = (1.0f - u) * v;
+        return Pt{a * q[0].x + b * q[1].x + c * q[2].x + d * q[3].x,
+                  a * q[0].y + b * q[1].y + c * q[2].y + d * q[3].y};
+    };
+    auto take = [&](float x, float y, float& luma, float& white) {
+        const int ix = (int)std::lround(x);
+        const int iy = (int)std::lround(y);
+        if (ix < 0 || iy < 0 || ix >= (int)w || iy >= (int)h) return false;
+        const float* p = linear + ((size_t)iy * w + ix) * 4;
+        const float r = std::max(0.0f, p[0]);
+        const float g = std::max(0.0f, p[1]);
+        const float b = std::max(0.0f, p[2]);
+        const float mx = std::max(r, std::max(g, b));
+        const float mn = std::min(r, std::min(g, b));
+        luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        white = mx > 1e-4f ? mn / mx : 0.0f;
+        return true;
+    };
+    std::vector<float> lumas, whites;
+    for (int j = 0; j < 7; ++j) {
+        for (int i = 0; i < 7; ++i) {
+            const Pt p = bilerp(0.32f + 0.06f * (float)i, 0.32f + 0.06f * (float)j);
+            float luma = 0, white = 0;
+            if (!take(p.x, p.y, luma, white)) continue;
+            lumas.push_back(luma);
+            whites.push_back(white);
+        }
+    }
+    if (lumas.size() < 16) return;
+    const float refLuma = percentile(lumas, 0.75);
+    const float refWhite = percentile(whites, 0.75);
+    if (refLuma < 1e-4f) return;
+    // 0 off the image, 1 table, 2 paper. Off the image is not table: a page
+    // that already fills the frame must not be pulled in. The bright quarter
+    // of the patch is the sheet showing between strokes; a sample that lands
+    // on the ink itself must not turn the margin into table.
+    auto classify = [&](float x, float y, float tx, float ty) {
+        float ls[25], ws[25];
+        int n = 0;
+        for (int j = -2; j <= 2; ++j) {
+            for (int i = -2; i <= 2; ++i) {
+                float luma = 0, white = 0;
+                if (!take(x + tx * (float)i * 7.0f + (-ty) * (float)j * 7.0f,
+                          y + ty * (float)i * 7.0f + tx * (float)j * 7.0f,
+                          luma, white))
+                    continue;
+                ls[n] = luma;
+                ws[n] = white;
+                ++n;
+            }
+        }
+        if (n < 8) return 0;
+        for (int a = 1; a < n; ++a) {
+            const float key = ls[a];
+            const float kw = ws[a];
+            int b = a;
+            while (b > 0 && ls[b - 1] > key) {
+                ls[b] = ls[b - 1];
+                ws[b] = ws[b - 1];
+                --b;
+            }
+            ls[b] = key;
+            ws[b] = kw;
+        }
+        const int at = (n * 3) / 4;
+        if (ws[at] >= refWhite - 0.11f && ls[at] >= refLuma * 0.38f) return 2;
+        return 1;
+    };
+
+    float span = 0;
+    for (int i = 0; i < 4; ++i)
+        span = std::max(span, dist(q[i], q[(i + 1) % 4]));
+    Line sides[4];
+    for (int i = 0; i < 4; ++i) {
+        const Pt a = q[i], b = q[(i + 1) % 4];
+        const float dx = b.x - a.x, dy = b.y - a.y;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        sides[i] = lineThrough(a, b);
+        if (len < 8.0f || !sides[i].ok) return;
+        float nx = dy / len, ny = -dx / len;
+        const float mx = (a.x + b.x) * 0.5f, my = (a.y + b.y) * 0.5f;
+        if ((mx - cx) * nx + (my - cy) * ny < 0) { nx = -nx; ny = -ny; }
+        const float reach = std::min(len * 0.45f, span * 0.45f);
+        // The printed border can sit well inside the sheet. Searching only a
+        // few dozen pixels outside the model side stops on that rule and
+        // drops the margin (and anything printed on it). The table is
+        // further out; look far enough to reach it.
+        const float out = std::min(len * 0.16f, 260.0f);
+        const float step = std::max(2.0f, len / 400.0f);
+        std::vector<float> hits;
+        for (int s = 1; s <= 7; ++s) {
+            const float t = 0.15f + 0.10f * (float)(s - 1);
+            const float px = a.x + dx * t, py = a.y + dy * t;
+            const int nOut = (int)std::ceil(out / step);
+            const int nIn = (int)std::ceil(reach / step);
+            const int n = nOut + nIn + 1;
+            std::vector<char> kind((size_t)n);
+            for (int k = 0; k < n; ++k) {
+                const float off = out - (float)k * step;
+                kind[(size_t)k] = (char)classify(px + nx * off, py + ny * off,
+                                                dx / len, dy / len);
+            }
+            // The page edge is the outermost place where the inward window
+            // is mostly paper and the outward window is on the table. A
+            // printed rule fails the inward window; a bright knot in the
+            // cloth fails it too.
+            const int win = std::max(6, (int)std::lround(72.0f / step));
+            for (int k = win; k + win < n; ++k) {
+                int inOn = 0, inP = 0, outOn = 0, outP = 0;
+                for (int t = 0; t < win; ++t) {
+                    const int inn = kind[(size_t)(k + t)];
+                    const int outk = kind[(size_t)(k - 1 - t)];
+                    if (inn) { ++inOn; if (inn == 2) ++inP; }
+                    if (outk) { ++outOn; if (outk == 2) ++outP; }
+                }
+                if (inOn * 5 >= win * 3 && inP * 5 >= inOn * 3 &&
+                    outOn * 5 >= win * 3 && outP * 5 <= outOn * 2) {
+                    int k2 = k;
+                    while (k2 + win < n && kind[(size_t)k2] == 1 &&
+                           (float)(k2 - k) * step < 64.0f)
+                        ++k2;
+                    hits.push_back(out - ((float)k2 - 0.5f) * step);
+                    break;
+                }
+            }
+        }
+        if ((int)hits.size() < 4) continue;
+        std::sort(hits.begin(), hits.end());
+        const float shift = hits[hits.size() / 2];
+        int agree = 0;
+        const float tol = std::max(12.0f, len * 0.06f);
+        for (float h : hits)
+            if (std::fabs(h - shift) <= tol) ++agree;
+        if (agree < 4 || std::fabs(shift) < 3.0f) continue;
+        // A large inward step that crosses strokes is the printed page, not
+        // the table. The sheet can be any colour; the ink is what marks it.
+        if (shift < -len * 0.02f) {
+            const float tx = dx / len, ty = dy / len;
+            int ink = 0, seen = 0;
+            for (int s = 1; s <= 5; ++s) {
+                const float t = 0.15f * (float)s;
+                const float sx = a.x + dx * t, sy = a.y + dy * t;
+                for (float off = shift; off < -4.0f; off += 12.0f) {
+                    float l0 = 0, w0 = 0, l1 = 0, w1 = 0;
+                    if (!take(sx + nx * off, sy + ny * off, l0, w0)) continue;
+                    if (!take(sx + nx * off + tx * 8.0f, sy + ny * off + ty * 8.0f, l1, w1))
+                        continue;
+                    ++seen;
+                    const float hi = std::max(l0, l1);
+                    const float lo = std::min(l0, l1);
+                    if (hi > refLuma * 0.30f && lo < hi * 0.62f) ++ink;
+                }
+            }
+            if (seen >= 8 && ink * 4 >= seen) continue;
+        }
+        const Pt a2{a.x + nx * shift, a.y + ny * shift};
+        const Pt b2{b.x + nx * shift, b.y + ny * shift};
+        const Line moved = lineThrough(a2, b2);
+        if (moved.ok) sides[i] = moved;
+    }
+    Pt refined[4];
+    for (int i = 0; i < 4; ++i) {
+        if (!intersectLines(sides[(i + 3) % 4], sides[i], refined[i])) return;
+    }
+    if (!convexQuad(refined)) return;
+    float jump = 0;
+    for (int i = 0; i < 4; ++i)
+        jump = std::max(jump, dist(refined[i], q[i]));
+    if (jump > span * 0.45f) return;
+    const float area0 = quadArea(q);
+    const float area1 = quadArea(refined);
+    // Growing past 8% used to be rejected outright, which kept a side that
+    // had locked onto the printed rule. A real margin around that rule is
+    // still the sheet. Shrinking stays capped so a misfire cannot eat the page.
+    if (area0 < 1.0f || area1 < area0 * 0.35f || area1 > area0 * 1.40f) return;
+    for (int i = 0; i < 4; ++i) q[i] = refined[i];
+}
+
 #ifdef VIEWMAGE_WITH_ORT
 // DocAligner LC100 heatmap. Apache-2.0, DocsaidLab.
 // img [1,3,256,256] BGR in 0..1, stretched (not letterboxed).
@@ -1393,6 +1587,36 @@ void spaceOutline(DocumentOutline& o, float minDist) {
     if (kept.size() >= 3) o.points.swap(kept);
 }
 
+DocumentDetect quadFromCorners(const Pt c[4]) {
+    DocumentDetect out;
+    out.found = true;
+    out.outline.shape = DocumentShape::Quad;
+    for (int i = 0; i < 4; ++i) {
+        out.quad.x[i] = c[i].x;
+        out.quad.y[i] = c[i].y;
+        out.outline.x.push_back(c[i].x);
+        out.outline.y.push_back(c[i].y);
+        out.outline.points.push_back(makePoint(PagePointKind::Corner, c[i]));
+    }
+    return out;
+}
+
+// A low-contrast frame is reported as the whole photo. That is right when
+// there is no border. When the scored finder sees a page inside the frame,
+// that quad is the page and the frame guess is the desk.
+bool finderInsteadOfFrame(const float* linear, uint32_t w, uint32_t h, DocumentDetect& out) {
+    const PageQuad pq = findPageQuad(linear, w, h);
+    if (!pq.ok) return false;
+    Pt c[4];
+    for (int i = 0; i < 4; ++i) c[i] = Pt{pq.x[i], pq.y[i]};
+    if (!convexQuad(c)) return false;
+    const float area = quadArea(c);
+    if (area < 0.08f * (float)w * (float)h) return false;
+    if (area > 0.92f * (float)w * (float)h) return false;
+    out = quadFromCorners(c);
+    return true;
+}
+
 DocumentDetect detectDocument(const float* linear, uint32_t w, uint32_t h) {
     DocumentDetect out;
     if (!linear || w < 16 || h < 16) {
@@ -1485,6 +1709,7 @@ DocumentDetect detectDocument(const float* linear, uint32_t w, uint32_t h) {
             out.error = "No document found";
             return out;
         }
+        if (finderInsteadOfFrame(linear, w, h, out)) return out;
         out.found = true;
         out.outline.shape = DocumentShape::Quad;
         out.quad.x[0] = 0;              out.quad.y[0] = 0;
@@ -1537,6 +1762,7 @@ DocumentDetect detectDocument(const float* linear, uint32_t w, uint32_t h) {
     // The page already fills the photo. Closing would eat the border, because
     // a dilate cannot grow past the frame and the matching erode then shrinks it.
     if (bright > (sw * sh * 85) / 100 && touch[0] && touch[1] && touch[2] && touch[3]) {
+        if (finderInsteadOfFrame(linear, w, h, out)) return out;
         out.found = true;
         out.outline.shape = DocumentShape::Quad;
         out.quad.x[0] = 0;              out.quad.y[0] = 0;
@@ -1817,9 +2043,38 @@ DocumentDetect detectDocument(const float* linear, uint32_t w, uint32_t h) {
 
     out.outline.shape = shape;
     if (shape == DocumentShape::Quad) {
-        for (int i = 0; i < 4; ++i) {
-            const Pt s = toSource(corners[i], sx, sy);
-            corners[i] = s;
+        bool usedFinder = false;
+        // The mask quad is already the page on a clean sheet. Replace it
+        // only when it fails the same inside/outside test the line scorer
+        // uses — that is the shadow, the seam, and the block of type.
+        if (!ruledReady) {
+            Pt maskSrc[4];
+            float mx[4], my[4];
+            for (int i = 0; i < 4; ++i) {
+                maskSrc[i] = toSource(corners[i], sx, sy);
+                mx[i] = maskSrc[i].x;
+                my[i] = maskSrc[i].y;
+            }
+            if (!scorePageQuad(linear, w, h, mx, my).ok) {
+                const PageQuad pq = findPageQuad(linear, w, h);
+                if (pq.ok) {
+                    Pt scored[4];
+                    for (int i = 0; i < 4; ++i) scored[i] = Pt{pq.x[i], pq.y[i]};
+                    const float sideMin = std::min({dist(scored[0], scored[1]),
+                                                    dist(scored[1], scored[2]),
+                                                    dist(scored[2], scored[3]),
+                                                    dist(scored[3], scored[0])});
+                    if (convexQuad(scored) &&
+                        quadArea(scored) >= 0.03f * (float)w * (float)h &&
+                        sideMin >= 16.0f) {
+                        for (int i = 0; i < 4; ++i) corners[i] = scored[i];
+                        usedFinder = true;
+                    }
+                }
+            }
+        }
+        if (!usedFinder) {
+            for (int i = 0; i < 4; ++i) corners[i] = toSource(corners[i], sx, sy);
         }
         if (!convexQuad(corners) || quadArea(corners) < 0.03f * (float)w * (float)h) {
             out.error = "No document found";
@@ -1941,14 +2196,47 @@ DocumentDetect detectRectangle(const float* linear, uint32_t w, uint32_t h,
     }
     if (cornerPeak)
         for (int i = 0; i < 4; ++i) cornerPeak[i] = peaks[i];
-    if (!got) return classical;
-    if (!refinePageCorners(linear, w, h, corners)) return classical;
+    auto pullClassical = [&](DocumentDetect det) {
+        if (!det.found || det.outline.shape != DocumentShape::Quad) return det;
+        Pt q[4];
+        for (int i = 0; i < 4; ++i) q[i] = {det.quad.x[i], det.quad.y[i]};
+        tightenPaperMargins(linear, w, h, q);
+        if (!convexQuad(q)) return det;
+        for (int i = 0; i < 4; ++i) {
+            det.quad.x[i] = q[i].x;
+            det.quad.y[i] = q[i].y;
+        }
+        int n = 0;
+        for (PagePoint& p : det.outline.points)
+            if (p.kind == PagePointKind::Corner && n < 4) {
+                p.x = q[n].x;
+                p.y = q[n].y;
+                ++n;
+            }
+        if (det.outline.x.size() == 4 && det.outline.y.size() == 4)
+            for (int i = 0; i < 4; ++i) {
+                det.outline.x[i] = q[i].x;
+                det.outline.y[i] = q[i].y;
+            }
+        return det;
+    };
+    if (!got) return pullClassical(classical);
+    if (!refinePageCorners(linear, w, h, corners)) return pullClassical(classical);
+    tightenPaperMargins(linear, w, h, corners);
     orderCorners(corners);
     if (!convexQuad(corners) || quadArea(corners) < 0.03f * (float)w * (float)h)
-        return classical;
+        return pullClassical(classical);
     const float sideMin = std::min({dist(corners[0], corners[1]), dist(corners[1], corners[2]),
                                     dist(corners[2], corners[3]), dist(corners[3], corners[0])});
-    if (sideMin < 16.0f) return classical;
+    if (sideMin < 16.0f) return pullClassical(classical);
+    float gateX[4], gateY[4];
+    for (int i = 0; i < 4; ++i) {
+        gateX[i] = corners[i].x;
+        gateY[i] = corners[i].y;
+    }
+    // A heatmap quad that fails the same polarity test as a classical one
+    // is a shadow or a block of type. The classical result stays.
+    if (!scorePageQuad(linear, w, h, gateX, gateY).ok) return pullClassical(classical);
     DocumentDetect out;
     out.found = true;
     out.outline.shape = DocumentShape::Quad;
@@ -2029,319 +2317,15 @@ DocumentScan flattenDocument(const float* linear, uint32_t w, uint32_t h,
     return out;
 }
 
-namespace {
-
-// A ruling in the rectified page. `at[i]` is the crossing on column (or row)
-// i, or -1 where the line was not seen.
-struct Ruling {
-    std::vector<float> at;
-    float mean = 0;
-    float dev = 0;
-    int seen = 0;
-};
-
-float lumaAt(const float* linear, uint32_t w, uint32_t h, float x, float y) {
-    const float r = sampleBicubic(linear, w, h, 0, x, y);
-    const float g = sampleBicubic(linear, w, h, 1, x, y);
-    const float b = sampleBicubic(linear, w, h, 2, x, y);
-    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
-}
-
-// Crossings of long ink lines. `horizontal` stores a y per column.
-std::vector<Ruling> traceRulings(const std::vector<float>& gray, int dw, int dh,
-                                 bool horizontal, int maxGap) {
-    const int nAlong = horizontal ? dw : dh;
-    const int nAcross = horizontal ? dh : dw;
-    const int rad = 2;
-    std::vector<float> blur;
-    boxBlur(gray, blur, dw, dh, rad);
-
-    std::vector<std::vector<int>> hits((size_t)nAlong);
-    for (int a = rad; a < nAlong - rad; ++a) {
-        for (int b = 8; b < nAcross - 8; ++b) {
-            const int x = horizontal ? a : b;
-            const int y = horizontal ? b : a;
-            const int i = y * dw + x;
-            const float g = gray[i];
-            const float m = blur[i];
-            if (!(g < m * 0.82f && (m - g) > 0.08f * std::max(m, 1e-4f))) continue;
-            // Look past the stroke. A thick rule is still dark two pixels out,
-            // and the paper is a little further.
-            float s0 = 0, s1 = 0;
-            for (int d = 3; d <= 7; ++d) {
-                if (horizontal) {
-                    s0 = std::max(s0, gray[(y - d) * dw + x]);
-                    s1 = std::max(s1, gray[(y + d) * dw + x]);
-                } else {
-                    s0 = std::max(s0, gray[y * dw + (x - d)]);
-                    s1 = std::max(s1, gray[y * dw + (x + d)]);
-                }
-            }
-            const float need = g + 0.06f * std::max(m, 1e-4f);
-            if (s0 > need && s1 > need) hits[a].push_back(b);
-        }
-    }
-    for (int a = 0; a < nAlong; ++a) {
-        const std::vector<int> col = hits[a];
-        std::vector<int> kept;
-        for (int i = 0; i < (int)col.size();) {
-            int j = i;
-            int best = col[i];
-            const auto gOf = [&](int b) {
-                const int x = horizontal ? a : b;
-                const int y = horizontal ? b : a;
-                return gray[(size_t)y * dw + x];
-            };
-            float bestG = gOf(col[i]);
-            while (j + 1 < (int)col.size() && col[j + 1] <= col[j] + 2) {
-                ++j;
-                const float g = gOf(col[j]);
-                if (g < bestG) { bestG = g; best = col[j]; }
-            }
-            kept.push_back(best);
-            i = j + 1;
-        }
-        hits[a].swap(kept);
-    }
-
-    struct Live { int id; int at; float pos; };
-    std::vector<Ruling> curves;
-    std::vector<Live> live;
-    for (int a = 0; a < nAlong; ++a) {
-        std::vector<char> used(hits[a].size(), 0);
-        std::vector<Live> next;
-        for (const Live& L : live) {
-            if (a - L.at > maxGap) continue;
-            int best = -1;
-            float bd = 3.5f;
-            for (int i = 0; i < (int)hits[a].size(); ++i) {
-                if (used[i]) continue;
-                const float d = std::fabs((float)hits[a][i] - L.pos);
-                if (d < bd) { bd = d; best = i; }
-            }
-            if (best < 0) {
-                next.push_back(L);
-                continue;
-            }
-            used[best] = 1;
-            const float pos = (float)hits[a][best];
-            curves[L.id].at[a] = pos;
-            ++curves[L.id].seen;
-            next.push_back(Live{L.id, a, pos});
-        }
-        for (int i = 0; i < (int)hits[a].size(); ++i) {
-            if (used[i]) continue;
-            Ruling c;
-            c.at.assign((size_t)nAlong, -1.0f);
-            c.at[a] = (float)hits[a][i];
-            c.seen = 1;
-            const int id = (int)curves.size();
-            curves.push_back(std::move(c));
-            next.push_back(Live{id, a, (float)hits[a][i]});
-        }
-        live.swap(next);
-    }
-    std::vector<Ruling> kept;
-    for (Ruling& c : curves) {
-        if (c.seen < nAlong * 4 / 10) continue;
-        double sum = 0;
-        float lo = 1e9f, hi = -1e9f;
-        for (float v : c.at) {
-            if (v < 0) continue;
-            sum += v;
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
-        }
-        c.mean = (float)(sum / c.seen);
-        c.dev = hi - lo;
-        // A ruling bends smoothly. A chain that jumps from one line to
-        // another is text, and pulling on it tears the words.
-        float step = 0;
-        int prev = -1;
-        for (int i = 0; i < (int)c.at.size(); ++i) {
-            if (c.at[i] < 0) continue;
-            if (prev >= 0 && i - prev <= 2)
-                step = std::max(step, std::fabs(c.at[i] - c.at[prev]));
-            prev = i;
-        }
-        if (step > 8.0f) continue;
-        kept.push_back(std::move(c));
-    }
-    return kept;
-}
-
-float rulingAt(const Ruling& c, int i) {
-    if (i < 0 || i >= (int)c.at.size()) return -1;
-    if (c.at[i] >= 0) return c.at[i];
-    int L = i, R = i;
-    while (L >= 0 && c.at[L] < 0) --L;
-    while (R < (int)c.at.size() && c.at[R] < 0) ++R;
-    if (L < 0 || R >= (int)c.at.size()) return -1;
-    const float t = (float)(i - L) / (float)(R - L);
-    return c.at[L] + (c.at[R] - c.at[L]) * t;
-}
-
-// Map an output coordinate to the rectified coordinate so each ruling lands
-// on its mean. `along` is the column (or row) the lookup sits on.
-std::vector<float> rulingMap(const std::vector<Ruling>& curves, int nAlong, int nAcross,
-                             bool bentOnly) {
-    std::vector<float> map((size_t)nAlong * nAcross);
-    for (int a = 0; a < nAlong; ++a) {
-        std::vector<std::pair<float, float>> knots;
-        knots.push_back({0.0f, 0.0f});
-        for (const Ruling& c : curves) {
-            if (bentOnly && c.dev < 1.0f) continue;
-            const float pos = rulingAt(c, a);
-            if (pos < 0) continue;
-            knots.push_back({c.mean, pos});
-        }
-        knots.push_back({(float)(nAcross - 1), (float)(nAcross - 1)});
-        std::sort(knots.begin(), knots.end(),
-                  [](auto p, auto q) { return p.first < q.first; });
-        std::vector<std::pair<float, float>> mono;
-        for (auto k : knots) {
-            if (!mono.empty() && k.first <= mono.back().first + 0.5f) continue;
-            if (!mono.empty() && k.second <= mono.back().second) continue;
-            mono.push_back(k);
-        }
-        if (mono.empty() || mono.back().first < (float)(nAcross - 1) - 0.5f)
-            mono.push_back({(float)(nAcross - 1), (float)(nAcross - 1)});
-        int seg = 0;
-        for (int b = 0; b < nAcross; ++b) {
-            const float t = (float)b;
-            while (seg + 1 < (int)mono.size() && mono[seg + 1].first < t) ++seg;
-            const auto A = mono[seg];
-            const auto B = mono[std::min(seg + 1, (int)mono.size() - 1)];
-            float v = A.second;
-            if (B.first > A.first + 1e-3f) {
-                const float u = std::clamp((t - A.first) / (B.first - A.first), 0.0f, 1.0f);
-                v = A.second + (B.second - A.second) * u;
-            }
-            map[(size_t)b * nAlong + a] = std::clamp(v, 0.0f, (float)(nAcross - 1));
-        }
-    }
-    return map;
-}
-
-float mapLookup(const std::vector<float>& map, int nAlong, int nAcross, float along, float across) {
-    if (map.empty()) return across;
-    along = std::clamp(along, 0.0f, (float)(nAlong - 1));
-    across = std::clamp(across, 0.0f, (float)(nAcross - 1));
-    const int a0 = (int)std::floor(along);
-    const int b0 = (int)std::floor(across);
-    const int a1 = std::min(a0 + 1, nAlong - 1);
-    const int b1 = std::min(b0 + 1, nAcross - 1);
-    const float ta = along - (float)a0;
-    const float tb = across - (float)b0;
-    auto at = [&](int b, int a) { return map[(size_t)b * nAlong + a]; };
-    const float r0 = at(b0, a0) + (at(b0, a1) - at(b0, a0)) * ta;
-    const float r1 = at(b1, a0) + (at(b1, a1) - at(b1, a0)) * ta;
-    return r0 + (r1 - r0) * tb;
-}
-
-}  // namespace
-
 DocumentScan reconstructRectangle(const float* linear, uint32_t w, uint32_t h,
                                   const DocumentQuad& quad) {
     DocumentScan flat = flattenDocument(linear, w, h, quad);
-    if (!flat.found || !linear) return flat;
-
-    Pt corners[4];
-    for (int i = 0; i < 4; ++i) corners[i] = Pt{quad.x[i], quad.y[i]};
-    const int ow = (int)flat.w;
-    const int oh = (int)flat.h;
-    Pt dst[4] = {{0, 0}, {(float)(ow - 1), 0},
-                 {(float)(ow - 1), (float)(oh - 1)}, {0, (float)(oh - 1)}};
-    double H[9];
-    if (!homography(dst, corners, H)) return flat;
-
-    const int detLong = 960;
-    const int pageLong = std::max(ow, oh);
-    const int dw = std::max(32, (int)std::lround((double)ow / pageLong * detLong));
-    const int dh = std::max(32, (int)std::lround((double)oh / pageLong * detLong));
-    std::vector<float> rect((size_t)dw * dh);
-    auto toOut = [&](int dx, int dy) {
-        return Pt{(float)dx * (float)(ow - 1) / (float)(dw - 1),
-                  (float)dy * (float)(oh - 1) / (float)(dh - 1)};
-    };
-    for (int y = 0; y < dh; ++y) {
-        for (int x = 0; x < dw; ++x) {
-            const Pt o = toOut(x, y);
-            const double X = o.x, Y = o.y;
-            const double den = H[6] * X + H[7] * Y + H[8];
-            if (std::fabs(den) < 1e-9) continue;
-            const float u = (float)((H[0] * X + H[1] * Y + H[2]) / den);
-            const float v = (float)((H[3] * X + H[4] * Y + H[5]) / den);
-            rect[(size_t)y * dw + x] = lumaAt(linear, w, h, u, v);
-        }
-    }
-
-    const std::vector<Ruling> horizontal = traceRulings(rect, dw, dh, true, 36);
-    float hDev = 0;
-    for (const Ruling& c : horizontal) hDev = std::max(hDev, c.dev);
-    // A pixel or two of ridge wander is the stroke, not a fold. The gate
-    // scales with the page so an upscaled straight rule does not move.
-    const float hGate = std::max(3.0f, 0.012f * (float)dh);
-    const bool bendH = hDev >= hGate && !horizontal.empty();
-    std::vector<float> mapY = bendH ? rulingMap(horizontal, dw, dh, false)
-                                    : std::vector<float>{};
-
-    std::vector<float> rectV = rect;
-    if (bendH) {
-        for (int y = 0; y < dh; ++y) {
-            for (int x = 0; x < dw; ++x) {
-                const float yr = mapLookup(mapY, dw, dh, (float)x, (float)y);
-                const int y0 = std::clamp((int)std::floor(yr), 0, dh - 1);
-                const int y1 = std::min(y0 + 1, dh - 1);
-                const float t = yr - (float)y0;
-                rectV[(size_t)y * dw + x] =
-                    rect[(size_t)y0 * dw + x] * (1.0f - t) +
-                    rect[(size_t)y1 * dw + x] * t;
-            }
-        }
-    }
-    const std::vector<Ruling> vertical = traceRulings(rectV, dw, dh, false, 10);
-    float vDev = 0;
-    for (const Ruling& c : vertical) vDev = std::max(vDev, c.dev);
-    const float vGate = std::max(3.0f, 0.012f * (float)dw);
-    // A crowd of short vertical strokes is body text. Bending each one
-    // independently waves the words. A few long rules are the columns.
-    const bool bendV = vDev >= vGate && vertical.size() >= 2 && vertical.size() <= 10;
-    std::vector<float> mapX = bendV ? rulingMap(vertical, dh, dw, false)
-                                    : std::vector<float>{};
-    // rulingMap for vertical stored across-major with nAlong = dh (rows) and
-    // nAcross = dw (columns). mapLookup(along=y, across=x) reads that layout
-    // only if nAlong is the first index's run length. Rebuild: the function
-    // indexes `b * nAlong + a` with a along the ruling and b across it.
-    // For a vertical ruling, `a` is y and `b` is x, so nAlong = dh, nAcross = dw,
-    // index = x * dh + y. mapLookup(map, dh, dw, y, x) returns the rectified x.
-
-    if (!bendH && !bendV) return flat;
-
-    DocumentScan out;
-    out.linear.assign((size_t)ow * oh * 4, 0.0f);
-    for (int y = 0; y < oh; ++y) {
-        for (int x = 0; x < ow; ++x) {
-            const float fx = (float)x * (float)(dw - 1) / (float)(ow - 1);
-            const float fy = (float)y * (float)(dh - 1) / (float)(oh - 1);
-            const float yr = bendH ? mapLookup(mapY, dw, dh, fx, fy) : fy;
-            const float xr = bendV ? mapLookup(mapX, dh, dw, yr, fx) : fx;
-            const float X = xr * (float)(ow - 1) / (float)(dw - 1);
-            const float Y = yr * (float)(oh - 1) / (float)(dh - 1);
-            const double den = H[6] * X + H[7] * Y + H[8];
-            if (std::fabs(den) < 1e-9) continue;
-            const float u = (float)((H[0] * X + H[1] * Y + H[2]) / den);
-            const float v = (float)((H[3] * X + H[4] * Y + H[5]) / den);
-            float* d = out.linear.data() + ((size_t)y * ow + x) * 4;
-            for (int c = 0; c < 4; ++c)
-                d[c] = sampleBicubic(linear, w, h, c, u, v);
-        }
-    }
-    out.found = true;
-    out.w = (uint32_t)ow;
-    out.h = (uint32_t)oh;
-    out.quad = flat.quad;
-    return out;
+    // A creased sheet is still one homography, so a straight rule stays a
+    // straight rule. The dark face is a slow multiply; lifting it does not
+    // move those rules. A page that is already even is left as it is.
+    if (flat.found)
+        evenShadedPage(flat.linear, flat.w, flat.h, false);
+    return flat;
 }
 
 Pt pp(const PagePoint& p) { return {p.x, p.y}; }

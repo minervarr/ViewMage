@@ -12,6 +12,7 @@ add_library(viewmage_core STATIC
     src/enhance.cc
     src/export_math.cc
     src/document_scan.cc
+    src/page_quad.cc
 )
 
 target_include_directories(viewmage_core PUBLIC
